@@ -1,0 +1,1404 @@
+from __future__ import annotations
+import csv
+import gc
+import glob
+import hashlib
+import importlib
+import logging
+import math
+import os
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("umud")
+
+
+# ---------------------------------------------------------------------------
+# Optional dependency handling
+# ---------------------------------------------------------------------------
+def _try_import(module_name: str):
+    """Import a module by name, returning None instead of raising."""
+    try:
+        return importlib.import_module(module_name)
+    except Exception:
+        return None
+
+
+cv2 = _try_import("cv2")
+pd = _try_import("pandas")
+torch = _try_import("torch")
+skimage_morphology = _try_import("skimage.morphology")
+scipy_signal = _try_import("scipy.signal")
+albumentations = _try_import("albumentations")
+smp = _try_import("segmentation_models_pytorch")
+
+if torch is not None:
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, Dataset
+
+if cv2 is None:
+    logger.error(
+        "OpenCV (cv2) is required and was not found. Install it with "
+        "'pip install opencv-python-headless' and re-run."
+    )
+    sys.exit(1)
+
+if pd is None:
+    logger.error("pandas is required and was not found. Install it and re-run.")
+    sys.exit(1)
+
+if torch is None:
+    logger.error(
+        "PyTorch is required for model training/inference and was not found. "
+        "Install it (e.g. 'pip install torch') and re-run."
+    )
+    sys.exit(1)
+
+
+def _ensure_optional_package(module, pip_name: str):
+    """
+    Attempt a one-time quiet pip install for an optional but strongly
+    preferred package (albumentations, segmentation-models-pytorch,
+    scikit-image, scipy). Never raises; returns the (possibly still None)
+    module.
+    """
+    if module is not None:
+        return module
+    try:
+        import subprocess
+
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", pip_name],
+            timeout=180,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return _try_import(pip_name.replace("-", "_"))
+    except Exception:
+        return None
+
+
+# Best-effort installs; the pipeline works without any of these.
+if smp is None:
+    smp = _ensure_optional_package(smp, "segmentation-models-pytorch")
+if albumentations is None:
+    albumentations = _ensure_optional_package(albumentations, "albumentations")
+if skimage_morphology is None:
+    _sk = _ensure_optional_package(None, "scikit-image")
+    skimage_morphology = _try_import("skimage.morphology")
+if scipy_signal is None:
+    scipy_signal = _try_import("scipy.signal")
+
+HAS_SMP = smp is not None
+HAS_ALBUMENTATIONS = albumentations is not None
+HAS_SKIMAGE = skimage_morphology is not None
+HAS_SCIPY_SIGNAL = scipy_signal is not None
+
+logger.info(
+    "Optional dependency status: smp=%s albumentations=%s skimage=%s scipy=%s",
+    HAS_SMP, HAS_ALBUMENTATIONS, HAS_SKIMAGE, HAS_SCIPY_SIGNAL,
+)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+@dataclass
+class Config:
+    # --- Paths -------------------------------------------------------------
+    BASE_DIR: str = "/----/input/competitions/umud-challenge-muscle-architecture-in-ultrasound-data"
+    WORK_DIR: str = "/----/working" if os.path.isdir("/----/working") else "."
+    MODEL_DIR: str = field(init=False)
+    EDA_DIR: str = field(init=False)
+    OUTPUT_CSV: str = field(init=False)
+
+    # --- Run switches --------------------------------------------------------
+    RUN_EDA: bool = True
+    RUN_TRAINING: bool = True
+    USE_TTA: bool = True  # horizontal-flip test-time augmentation
+
+    # --- Image / model settings ---------------------------------------------
+    IMG_SIZE: int = 512
+    BATCH_SIZE: int = 8
+    INFER_BATCH_SIZE: int = 16
+    NUM_WORKERS: int = 2
+    RANDOM_SEED: int = 42
+
+    # --- Training hyperparameters --------------------------------------------
+    EPOCHS: int = 12
+    LEARNING_RATE: float = 2e-3
+    WEIGHT_DECAY: float = 1e-4
+    VAL_FRACTION: float = 0.2
+    N_FOLDS: int = 1  # set > 1 to enable k-fold cross-validation
+    APO_MASK_THRESHOLD: float = 0.5
+    FASC_MASK_THRESHOLD: float = 0.4
+    FASC_MIN_COMPONENT_AREA: int = 30
+
+    # --- Geometry / physiological bounds -------------------------------------
+    PA_MIN_DEG: float = 5.0
+    PA_MAX_DEG: float = 45.0
+    FL_MIN_MM: float = 20.0
+    FL_MAX_MM: float = 250.0
+    MT_MIN_MM: float = 5.0
+    MT_MAX_MM: float = 60.0
+    FALLBACK_PA_DEG: float = 20.0
+    FALLBACK_FL_MM: float = 60.0
+    FALLBACK_MT_MM: float = 20.0
+    DEFAULT_MM_PER_PIXEL: float = 0.075  # literature-typical MSK-US calibration
+
+    def __post_init__(self):
+        self.MODEL_DIR = os.path.join(self.WORK_DIR, "models")
+        self.EDA_DIR = os.path.join(self.WORK_DIR, "eda_outputs")
+        self.OUTPUT_CSV = os.path.join(self.WORK_DIR, "submission.csv")
+        os.makedirs(self.MODEL_DIR, exist_ok=True)
+        os.makedirs(self.EDA_DIR, exist_ok=True)
+
+
+CFG = Config()
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if DEVICE.type == "cuda":
+    torch.backends.cudnn.benchmark = True
+
+np.random.seed(CFG.RANDOM_SEED)
+torch.manual_seed(CFG.RANDOM_SEED)
+
+VALID_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
+
+
+# ---------------------------------------------------------------------------
+# Path resolution & data discovery
+# ---------------------------------------------------------------------------
+def resolve_base_dir(preferred: str) -> str:
+    """Return a working dataset root, searching common ---- locations
+    if the preferred path does not exist."""
+    if os.path.isdir(preferred):
+        return preferred
+
+    logger.warning("Preferred dataset path not found: %s", preferred)
+    search_roots = ["/----/input", "."]
+    for root in search_roots:
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            if "umud" in name.lower():
+                candidate = os.path.join(root, name)
+                if os.path.isdir(candidate):
+                    logger.info("Falling back to discovered dataset path: %s", candidate)
+                    return candidate
+
+    raise FileNotFoundError(
+        f"Could not locate the UMUD dataset. Checked '{preferred}' and "
+        f"searched {search_roots} for a folder containing 'umud'. Please "
+        f"attach the competition dataset to this notebook/session."
+    )
+
+
+def find_directory(base_dir: str, keyword: str) -> Optional[str]:
+    """Recursively find the first directory under base_dir whose name
+    contains keyword (case-insensitive)."""
+    keyword = keyword.lower()
+    if os.path.isdir(base_dir) and keyword in os.path.basename(base_dir).lower():
+        return base_dir
+    for root, dirs, _ in os.walk(base_dir):
+        for d in dirs:
+            if keyword in d.lower():
+                return os.path.join(root, d)
+    return None
+
+
+def list_images_recursive(directory: str) -> List[str]:
+    if directory is None or not os.path.isdir(directory):
+        return []
+    paths = []
+    for root, _, files in os.walk(directory):
+        for f in files:
+            if f.lower().endswith(VALID_EXTS):
+                paths.append(os.path.join(root, f))
+    return sorted(paths)
+
+
+def match_image_mask_pairs(img_dir: str, mask_dir: str) -> Tuple[List[str], List[str]]:
+    """Match image/mask files, tolerant of nested (e.g. per-subject)
+    subfolders and minor naming differences. Relative path is tried
+    first (most specific, avoids collisions when subfolder structure
+    mirrors between the image and mask trees); bare filename is used as
+    a fallback for flatter dataset layouts."""
+    if img_dir is None or mask_dir is None:
+        return [], []
+
+    mask_by_relpath: Dict[str, str] = {}
+    mask_by_name: Dict[str, str] = {}
+    mask_by_stem: Dict[str, str] = {}
+    for root, _, files in os.walk(mask_dir):
+        for f in files:
+            if f.lower().endswith(VALID_EXTS):
+                full_path = os.path.join(root, f)
+                rel = os.path.relpath(full_path, mask_dir)
+                mask_by_relpath[rel] = full_path
+                mask_by_name.setdefault(f, full_path)
+                mask_by_stem.setdefault(os.path.splitext(f)[0], full_path)
+
+    img_paths, mask_paths = [], []
+    for root, _, files in os.walk(img_dir):
+        for f in files:
+            if not f.lower().endswith(VALID_EXTS):
+                continue
+            full_img_path = os.path.join(root, f)
+            rel = os.path.relpath(full_img_path, img_dir)
+            stem = os.path.splitext(f)[0]
+
+            candidate = mask_by_relpath.get(rel) or mask_by_name.get(f) or mask_by_stem.get(stem)
+            if candidate:
+                img_paths.append(full_img_path)
+                mask_paths.append(candidate)
+
+    return img_paths, mask_paths
+
+
+def hash_file_bytes(path: str, chunk_size: int = 65536) -> Optional[str]:
+    """MD5 hash of a file's bytes, used only to flag duplicate training
+    images (see the competition discussion notice about duplicated
+    training samples). Never raises."""
+    try:
+        h = hashlib.md5()
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(chunk_size)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def deduplicate_pairs(img_paths: List[str], mask_paths: List[str]) -> Tuple[List[str], List[str], int]:
+    """Drop pairs whose image content is an exact duplicate of an
+    already-seen image, keeping the first occurrence. This only affects
+    the internal train/validation split quality, never the test set."""
+    seen = set()
+    keep_img, keep_mask = [], []
+    n_dupes = 0
+    for ip, mp in zip(img_paths, mask_paths):
+        digest = hash_file_bytes(ip)
+        if digest is None:
+            keep_img.append(ip)
+            keep_mask.append(mp)
+            continue
+        if digest in seen:
+            n_dupes += 1
+            continue
+        seen.add(digest)
+        keep_img.append(ip)
+        keep_mask.append(mp)
+    return keep_img, keep_mask, n_dupes
+
+
+def sniff_csv_delimiter(path: str) -> str:
+    """Detect whether a CSV uses comma or semicolon separators."""
+    try:
+        with open(path, "r", newline="", encoding="utf-8", errors="ignore") as fh:
+            sample = fh.readline()
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;")
+            return dialect.delimiter
+        except csv.Error:
+            return ";" if sample.count(";") > sample.count(",") else ","
+    except Exception:
+        return ","
+
+
+def load_sample_submission(base_dir: str) -> Tuple[Optional["pd.DataFrame"], str]:
+    """Locate and load sample_submission.csv, auto-detecting its
+    delimiter. Returns (dataframe_or_None, delimiter)."""
+    candidates = glob.glob(os.path.join(base_dir, "**", "sample_submission*.csv"), recursive=True)
+    if not candidates:
+        logger.warning("sample_submission.csv not found under %s", base_dir)
+        return None, ","
+
+    path = candidates[0]
+    delimiter = sniff_csv_delimiter(path)
+    try:
+        df = pd.read_csv(path, sep=delimiter)
+    except Exception:
+        try:
+            df = pd.read_csv(path, sep=None, engine="python")
+            delimiter = ","
+        except Exception as exc:
+            logger.error("Failed to parse sample submission at %s: %s", path, exc)
+            return None, ","
+
+    df.columns = [c.strip() for c in df.columns]
+    logger.info(
+        "Loaded sample submission: %s (%d rows, delimiter=%r, columns=%s)",
+        path, len(df), delimiter, list(df.columns),
+    )
+    return df, delimiter
+
+
+def find_metadata_csv(base_dir: str) -> Tuple[Optional["pd.DataFrame"], Optional[str]]:
+    """Look for an accompanying CSV with a pixel-spacing / scale column
+    that could be used for precise mm-per-pixel calibration."""
+    spacing_keywords = ("spacing", "scale", "pixel", "mm_per_px", "resolution", "calib")
+    for path in glob.glob(os.path.join(base_dir, "**", "*.csv"), recursive=True):
+        name = os.path.basename(path).lower()
+        if "submission" in name:
+            continue
+        try:
+            df = pd.read_csv(path, nrows=5)
+        except Exception:
+            continue
+        cols_lower = [c.lower() for c in df.columns]
+        for kw in spacing_keywords:
+            for i, col in enumerate(cols_lower):
+                if kw in col:
+                    try:
+                        full_df = pd.read_csv(path)
+                        logger.info(
+                            "Found calibration metadata file '%s' (column '%s')",
+                            path, df.columns[i],
+                        )
+                        return full_df, df.columns[i]
+                    except Exception:
+                        continue
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Exploratory Data Analysis
+# ---------------------------------------------------------------------------
+def run_eda(apo_imgs: List[str], apo_masks: List[str],
+            fasc_imgs: List[str], fasc_masks: List[str],
+            test_imgs: List[str], out_dir: str) -> None:
+    """Generate summary statistics and diagnostic plots. Never raises;
+    EDA failures are logged and skipped rather than aborting the run."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    logger.info("Running EDA (%d apo pairs, %d fasc pairs, %d test images)",
+                len(apo_imgs), len(fasc_imgs), len(test_imgs))
+
+    def _shape_of(path: str) -> Optional[Tuple[int, int]]:
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        return None if img is None else img.shape
+
+    def _mask_positive_ratio(path: str) -> Optional[float]:
+        m = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if m is None or m.size == 0:
+            return None
+        return float((m > 127).sum()) / m.size
+
+    # --- 1. Dataset size --------------------------------
+    _, _, n_dupes_apo = deduplicate_pairs(apo_imgs, apo_masks)
+    _, _, n_dupes_fasc = deduplicate_pairs(fasc_imgs, fasc_masks)
+    logger.info(
+        "Duplicate images detected -> aponeurosis: %d / %d, fascicle: %d / %d",
+        n_dupes_apo, len(apo_imgs), n_dupes_fasc, len(fasc_imgs),
+    )
+
+    # --- 2. Image dimension distributions ------------------------------------
+    try:
+        sample_n = min(200, len(apo_imgs))
+        apo_shapes = [s for s in (_shape_of(p) for p in apo_imgs[:sample_n]) if s]
+        sample_n = min(200, len(fasc_imgs))
+        fasc_shapes = [s for s in (_shape_of(p) for p in fasc_imgs[:sample_n]) if s]
+        sample_n = min(200, len(test_imgs))
+        test_shapes = [s for s in (_shape_of(p) for p in test_imgs[:sample_n]) if s]
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        for ax, shapes, title in zip(
+            axes, [apo_shapes, fasc_shapes, test_shapes],
+            ["Aponeurosis images", "Fascicle images", "Test images"],
+        ):
+            if shapes:
+                heights = [s[0] for s in shapes]
+                widths = [s[1] for s in shapes]
+                ax.scatter(widths, heights, alpha=0.4, s=10)
+            ax.set_title(title)
+            ax.set_xlabel("width (px)")
+            ax.set_ylabel("height (px)")
+        fig.suptitle("Image resolution spread by source")
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "01_image_dimensions.png"), dpi=110)
+        plt.close(fig)
+    except Exception as exc:
+        logger.warning("EDA dimension plot failed: %s", exc)
+
+    # --- 3. Mask positive-pixel ratio ----------------------
+    try:
+        sample_n = min(300, len(apo_masks))
+        apo_ratios = [r for r in (_mask_positive_ratio(p) for p in apo_masks[:sample_n]) if r is not None]
+        sample_n = min(300, len(fasc_masks))
+        fasc_ratios = [r for r in (_mask_positive_ratio(p) for p in fasc_masks[:sample_n]) if r is not None]
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        if apo_ratios:
+            ax.hist(apo_ratios, bins=30, alpha=0.6, label=f"aponeurosis (mean={np.mean(apo_ratios):.3%})")
+        if fasc_ratios:
+            ax.hist(fasc_ratios, bins=30, alpha=0.6, label=f"fascicle (mean={np.mean(fasc_ratios):.3%})")
+        ax.set_xlabel("fraction of positive (foreground) pixels")
+        ax.set_ylabel("count")
+        ax.set_title("Mask foreground ratio: class imbalance check")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "02_mask_class_balance.png"), dpi=110)
+        plt.close(fig)
+
+        if fasc_ratios and np.mean(fasc_ratios) < 0.02:
+            logger.info(
+                "Fascicle masks cover only ~%.2f%% of pixels on average -> "
+                "severe class imbalance, Dice+BCE loss is used to compensate.",
+                100 * np.mean(fasc_ratios),
+            )
+    except Exception as exc:
+        logger.warning("EDA class-balance plot failed: %s", exc)
+
+    # --- 4. Sample image--------------------------------------
+    try:
+        fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+        if apo_imgs and apo_masks:
+            img = cv2.imread(apo_imgs[0], cv2.IMREAD_GRAYSCALE)
+            msk = cv2.imread(apo_masks[0], cv2.IMREAD_GRAYSCALE)
+            axes[0, 0].imshow(img, cmap="gray")
+            axes[0, 0].set_title(f"Aponeurosis image {img.shape if img is not None else 'NA'}")
+            axes[0, 1].imshow(msk, cmap="magma")
+            axes[0, 1].set_title("Aponeurosis mask")
+        if fasc_imgs and fasc_masks:
+            img = cv2.imread(fasc_imgs[0], cv2.IMREAD_GRAYSCALE)
+            msk = cv2.imread(fasc_masks[0], cv2.IMREAD_GRAYSCALE)
+            axes[1, 0].imshow(img, cmap="gray")
+            axes[1, 0].set_title(f"Fascicle image {img.shape if img is not None else 'NA'}")
+            axes[1, 1].imshow(msk, cmap="magma")
+            axes[1, 1].set_title("Fascicle mask")
+        for ax in axes.ravel():
+            ax.axis("off")
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "03_sample_pairs.png"), dpi=110)
+        plt.close(fig)
+    except Exception as exc:
+        logger.warning("EDA sample overlay plot failed: %s", exc)
+
+    # --- 5. Test-set mean brightness (train/test domain-gap sanity check) ----
+    try:
+        def _mean_intensity(path):
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            return None if img is None else float(img.mean())
+
+        sample_n = min(150, len(apo_imgs))
+        train_int = [v for v in (_mean_intensity(p) for p in apo_imgs[:sample_n]) if v is not None]
+        sample_n = min(150, len(test_imgs))
+        test_int = [v for v in (_mean_intensity(p) for p in test_imgs[:sample_n]) if v is not None]
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        if train_int:
+            ax.hist(train_int, bins=30, alpha=0.6, label="train (aponeurosis set)")
+        if test_int:
+            ax.hist(test_int, bins=30, alpha=0.6, label="test")
+        ax.set_xlabel("mean pixel intensity (0-255)")
+        ax.set_ylabel("count")
+        ax.set_title("Train vs test brightness distribution")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "04_intensity_domain_gap.png"), dpi=110)
+        plt.close(fig)
+    except Exception as exc:
+        logger.warning("EDA intensity plot failed: %s", exc)
+
+    logger.info("EDA complete. Plots saved to %s", out_dir)
+
+
+# ---------------------------------------------------------------------------
+# Augmentation
+# ---------------------------------------------------------------------------
+def build_train_transform(img_size: int):
+    if HAS_ALBUMENTATIONS:
+        return albumentations.Compose([
+            albumentations.Resize(img_size, img_size),
+            albumentations.HorizontalFlip(p=0.5),
+            albumentations.Affine(scale=(0.9, 1.1), translate_percent=(-0.05, 0.05),
+                                   rotate=(-15, 15), p=0.5),
+            albumentations.RandomBrightnessContrast(p=0.3),
+        ])
+    return None
+
+
+def fallback_augment(img: np.ndarray, mask: np.ndarray, img_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Minimal dependency-free augmentation used only when
+    albumentations could not be imported/installed."""
+    img = cv2.resize(img, (img_size, img_size))
+    mask = cv2.resize(mask, (img_size, img_size), interpolation=cv2.INTER_NEAREST)
+
+    if np.random.rand() < 0.5:
+        img = np.ascontiguousarray(img[:, ::-1])
+        mask = np.ascontiguousarray(mask[:, ::-1])
+
+    if np.random.rand() < 0.3:
+        alpha = 1.0 + np.random.uniform(-0.2, 0.2)  # contrast
+        beta = np.random.uniform(-15, 15)  # brightness
+        img = np.clip(img.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
+
+    return img, mask
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+class SegmentationDataset(Dataset):
+    """Grayscale image/mask pairs, resized to a fixed square size.
+    Corrupt or unreadable files are logged once and substituted with a
+    blank sample so a single bad file cannot crash a training epoch."""
+
+    def __init__(self, image_paths: List[str], mask_paths: List[str],
+                 img_size: int, train: bool = True):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.img_size = img_size
+        self.train = train
+        self.transform = build_train_transform(img_size) if train else None
+        self._warned = False
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def _safe_read(self, idx: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        try:
+            img = cv2.imread(self.image_paths[idx], cv2.IMREAD_GRAYSCALE)
+            mask = cv2.imread(self.mask_paths[idx], cv2.IMREAD_GRAYSCALE)
+            if img is None or mask is None:
+                return None, None
+            if img.shape != mask.shape:
+                mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+            return img, mask
+        except Exception as exc:
+            if not self._warned:
+                logger.warning("Unreadable sample at index %d (%s): %s", idx, self.image_paths[idx], exc)
+                self._warned = True
+            return None, None
+
+    def __getitem__(self, idx: int):
+        img, mask = self._safe_read(idx)
+        if img is None:
+            # Fall back to a blank sample rather than raising mid-epoch.
+            img = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
+            mask = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
+        else:
+            if self.transform is not None:
+                augmented = self.transform(image=img, mask=mask)
+                img, mask = augmented["image"], augmented["mask"]
+            elif self.train:
+                img, mask = fallback_augment(img, mask, self.img_size)
+            else:
+                img = cv2.resize(img, (self.img_size, self.img_size))
+                mask = cv2.resize(mask, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
+
+        img_t = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
+        mask_t = torch.from_numpy((mask > 127).astype(np.float32)).unsqueeze(0)
+        return img_t, mask_t
+
+
+class TestImageDataset(Dataset):
+    """Loads test images for batched inference, keeping the original
+    resolution so masks can be resized back for geometry extraction."""
+
+    def __init__(self, image_records: List[Tuple[str, str]], img_size: int):
+        self.records = image_records  # list of (path, image_id)
+        self.img_size = img_size
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int):
+        path, image_id = self.records[idx]
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            # Return a flagged blank sample; handled downstream via orig_h<=0.
+            blank = np.zeros((self.img_size, self.img_size), dtype=np.float32)
+            return torch.from_numpy(blank).unsqueeze(0), 0, 0, image_id, path
+        orig_h, orig_w = img.shape
+        resized = cv2.resize(img, (self.img_size, self.img_size)).astype(np.float32) / 255.0
+        return torch.from_numpy(resized).unsqueeze(0), orig_h, orig_w, image_id, path
+
+
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
+class DiceBCELoss(nn.Module):
+    """Combined Dice + BCE loss; implemented from scratch so training does
+    not hard-depend on segmentation_models_pytorch's loss module."""
+
+    def __init__(self, smooth: float = 1.0):
+        super().__init__()
+        self.smooth = smooth
+        self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(self, logits: "torch.Tensor", targets: "torch.Tensor") -> "torch.Tensor":
+        bce_loss = self.bce(logits, targets)
+        probs = torch.sigmoid(logits)
+        probs_flat = probs.reshape(probs.size(0), -1)
+        targets_flat = targets.reshape(targets.size(0), -1)
+        intersection = (probs_flat * targets_flat).sum(dim=1)
+        dice = (2 * intersection + self.smooth) / (
+            probs_flat.sum(dim=1) + targets_flat.sum(dim=1) + self.smooth
+        )
+        return bce_loss + (1 - dice.mean())
+
+
+def dice_score(logits: "torch.Tensor", targets: "torch.Tensor", threshold: float = 0.5) -> float:
+    with torch.no_grad():
+        preds = (torch.sigmoid(logits) > threshold).float()
+        preds_flat = preds.reshape(preds.size(0), -1)
+        targets_flat = targets.reshape(targets.size(0), -1)
+        intersection = (preds_flat * targets_flat).sum(dim=1)
+        denom = preds_flat.sum(dim=1) + targets_flat.sum(dim=1)
+        dice = (2 * intersection + 1.0) / (denom + 1.0)
+        return float(dice.mean().item())
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class SimpleUNet(nn.Module):
+    """Compact from-scratch U-Net used as a fully offline fallback when
+    segmentation_models_pytorch (and its pretrained encoder weights) is
+    unavailable. No external downloads required."""
+
+    def __init__(self, in_channels: int = 1, out_channels: int = 1, base: int = 32):
+        super().__init__()
+        self.enc1 = ConvBlock(in_channels, base)
+        self.enc2 = ConvBlock(base, base * 2)
+        self.enc3 = ConvBlock(base * 2, base * 4)
+        self.enc4 = ConvBlock(base * 4, base * 8)
+        self.pool = nn.MaxPool2d(2)
+
+        self.bottleneck = ConvBlock(base * 8, base * 16)
+
+        self.up4 = nn.ConvTranspose2d(base * 16, base * 8, 2, stride=2)
+        self.dec4 = ConvBlock(base * 16, base * 8)
+        self.up3 = nn.ConvTranspose2d(base * 8, base * 4, 2, stride=2)
+        self.dec3 = ConvBlock(base * 8, base * 4)
+        self.up2 = nn.ConvTranspose2d(base * 4, base * 2, 2, stride=2)
+        self.dec2 = ConvBlock(base * 4, base * 2)
+        self.up1 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)
+        self.dec1 = ConvBlock(base * 2, base)
+
+        self.out_conv = nn.Conv2d(base, out_channels, 1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+        b = self.bottleneck(self.pool(e4))
+
+        d4 = self.dec4(torch.cat([self.up4(b), e4], dim=1))
+        d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+
+        return self.out_conv(d1)
+
+
+def build_segmentation_model() -> "nn.Module":
+    """Preferred: ResNet34-encoder U-Net with ImageNet weights via
+    segmentation_models_pytorch. Falls back to a from-scratch U-Net if
+    the package or its pretrained weights cannot be obtained (e.g. no
+    internet access at runtime)."""
+    if HAS_SMP:
+        try:
+            model = smp.Unet(
+                encoder_name="resnet34",
+                encoder_weights="imagenet",
+                in_channels=1,
+                classes=1,
+            )
+            logger.info("Using segmentation_models_pytorch U-Net (ResNet34, ImageNet weights).")
+            return model.to(DEVICE)
+        except Exception as exc:
+            logger.warning("Falling back to SimpleUNet: could not build smp.Unet (%s)", exc)
+
+    logger.info("Using dependency-free SimpleUNet (trained from scratch).")
+    return SimpleUNet(in_channels=1, out_channels=1).to(DEVICE)
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+def make_group_kfold_indices(n_samples: int, n_folds: int, seed: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Simple shuffled K-fold split (used for cross-validation when
+    Config.N_FOLDS > 1)."""
+    rng = np.random.RandomState(seed)
+    indices = rng.permutation(n_samples)
+    folds = np.array_split(indices, n_folds)
+    splits = []
+    for i in range(n_folds):
+        val_idx = folds[i]
+        train_idx = np.concatenate([folds[j] for j in range(n_folds) if j != i])
+        splits.append((train_idx, val_idx))
+    return splits
+
+
+def train_segmentation_model(
+    name: str,
+    img_paths: List[str],
+    mask_paths: List[str],
+    cfg: Config,
+) -> str:
+    """Trains a binary segmentation model and returns the path to the
+    best checkpoint on disk. Uses a single holdout split by default;
+    set cfg.N_FOLDS > 1 to run proper k-fold cross-validation (the fold
+    with the best validation Dice is kept for inference)."""
+    checkpoint_path = os.path.join(cfg.MODEL_DIR, f"best_{name}_unet.pth")
+
+    if len(img_paths) == 0:
+        logger.error("No training pairs found for '%s'; skipping training.", name)
+        return checkpoint_path
+
+    n = len(img_paths)
+    n_folds = max(1, cfg.N_FOLDS)
+    if n_folds == 1:
+        rng = np.random.RandomState(cfg.RANDOM_SEED)
+        idx = rng.permutation(n)
+        val_size = max(1, int(n * cfg.VAL_FRACTION))
+        splits = [(idx[val_size:], idx[:val_size])]
+    else:
+        splits = make_group_kfold_indices(n, n_folds, cfg.RANDOM_SEED)
+
+    best_overall_dice = -1.0
+    criterion = DiceBCELoss()
+    use_amp = DEVICE.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    for fold_i, (train_idx, val_idx) in enumerate(splits):
+        logger.info(
+            "[%s] fold %d/%d -> %d train / %d val samples",
+            name, fold_i + 1, n_folds, len(train_idx), len(val_idx),
+        )
+
+        train_imgs = [img_paths[i] for i in train_idx]
+        train_masks = [mask_paths[i] for i in train_idx]
+        val_imgs = [img_paths[i] for i in val_idx]
+        val_masks = [mask_paths[i] for i in val_idx]
+
+        train_ds = SegmentationDataset(train_imgs, train_masks, cfg.IMG_SIZE, train=True)
+        val_ds = SegmentationDataset(val_imgs, val_masks, cfg.IMG_SIZE, train=False)
+
+        train_loader = DataLoader(
+            train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,
+            num_workers=cfg.NUM_WORKERS, pin_memory=(DEVICE.type == "cuda"),
+            drop_last=len(train_ds) > cfg.BATCH_SIZE,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=cfg.BATCH_SIZE, shuffle=False,
+            num_workers=cfg.NUM_WORKERS, pin_memory=(DEVICE.type == "cuda"),
+        )
+
+        model = build_segmentation_model()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LEARNING_RATE,
+                                       weight_decay=cfg.WEIGHT_DECAY)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS)
+
+        best_fold_dice = -1.0
+        for epoch in range(1, cfg.EPOCHS + 1):
+            t0 = time.time()
+            model.train()
+            running_loss = 0.0
+            for images, masks in train_loader:
+                images = images.to(DEVICE, non_blocking=True)
+                masks = masks.to(DEVICE, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    outputs = model(images)
+                    loss = criterion(outputs, masks)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                running_loss += loss.item() * images.size(0)
+
+            scheduler.step()
+            train_loss = running_loss / max(1, len(train_ds))
+
+            model.eval()
+            val_loss, val_dice, n_val = 0.0, 0.0, 0
+            with torch.no_grad():
+                for images, masks in val_loader:
+                    images = images.to(DEVICE, non_blocking=True)
+                    masks = masks.to(DEVICE, non_blocking=True)
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        outputs = model(images)
+                        loss = criterion(outputs, masks)
+                    val_loss += loss.item() * images.size(0)
+                    val_dice += dice_score(outputs, masks) * images.size(0)
+                    n_val += images.size(0)
+
+            val_loss = val_loss / max(1, n_val)
+            val_dice = val_dice / max(1, n_val)
+            elapsed = time.time() - t0
+
+            logger.info(
+                "[%s] fold %d epoch %02d/%d | train_loss=%.4f val_loss=%.4f val_dice=%.4f (%.1fs)",
+                name, fold_i + 1, epoch, cfg.EPOCHS, train_loss, val_loss, val_dice, elapsed,
+            )
+
+            if val_dice > best_fold_dice:
+                best_fold_dice = val_dice
+                if val_dice > best_overall_dice:
+                    best_overall_dice = val_dice
+                    torch.save(model.state_dict(), checkpoint_path)
+
+        del model, optimizer, scheduler
+        gc.collect()
+        if DEVICE.type == "cuda":
+            torch.cuda.empty_cache()
+
+    logger.info("[%s] training complete. Best validation Dice: %.4f (checkpoint: %s)",
+                name, best_overall_dice, checkpoint_path)
+    return checkpoint_path
+
+
+def load_model_checkpoint(checkpoint_path: str) -> "nn.Module":
+    model = build_segmentation_model()
+    if os.path.isfile(checkpoint_path):
+        try:
+            state = torch.load(checkpoint_path, map_location=DEVICE)
+            model.load_state_dict(state)
+            logger.info("Loaded checkpoint: %s", checkpoint_path)
+        except Exception as exc:
+            logger.warning("Could not load checkpoint %s (%s); using untrained weights.",
+                            checkpoint_path, exc)
+    else:
+        logger.warning("Checkpoint not found at %s; using untrained weights.", checkpoint_path)
+    model.eval()
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Calibration (pixels -> millimetres)
+# ---------------------------------------------------------------------------
+def estimate_ruler_spacing(image_path: str, default_mm_per_px: float) -> float:
+    """Detect bright ruler tick marks in the image margins and estimate
+    mm-per-pixel from their spacing (1 cm between major ticks is a common
+    MSK ultrasound convention). Falls back to the documented default if
+    detection is inconclusive or scipy is unavailable."""
+    try:
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return default_mm_per_px
+        h, w = img.shape
+        rois = [img[:, : int(w * 0.15)], img[:, int(w * 0.85):]]
+
+        for roi in rois:
+            _, thresh = cv2.threshold(roi, 200, 255, cv2.THRESH_BINARY)
+            row_sums = thresh.sum(axis=1)
+
+            if HAS_SCIPY_SIGNAL:
+                peaks, _ = scipy_signal.find_peaks(row_sums, height=255, distance=30)
+            else:
+                peaks = np.where(row_sums > row_sums.max() * 0.9)[0] if row_sums.max() > 0 else np.array([])
+
+            if len(peaks) >= 2:
+                diffs = np.diff(np.sort(peaks))
+                median_diff = float(np.median(diffs))
+                if 30 < median_diff < 300:
+                    return 10.0 / median_diff  # 1 cm between major ticks
+
+        return default_mm_per_px
+    except Exception:
+        return default_mm_per_px
+
+
+def build_calibration_lookup(base_dir: str, cfg: Config) -> Dict[str, float]:
+    """Returns a mapping {image_id/filename: mm_per_pixel} sourced from
+    an explicit metadata file if one exists in the dataset."""
+    lookup: Dict[str, float] = {}
+    metadata_df, spacing_col = find_metadata_csv(base_dir)
+    if metadata_df is not None and spacing_col is not None and "image_id" in metadata_df.columns:
+        for _, row in metadata_df.iterrows():
+            try:
+                value = float(row[spacing_col])
+                if value > 0 and not math.isnan(value):
+                    lookup[str(row["image_id"])] = value
+            except (TypeError, ValueError):
+                continue
+        logger.info("Loaded %d per-image calibration values from metadata.", len(lookup))
+    else:
+        logger.info(
+            "No calibration metadata file found; mm/px will be estimated per-image via "
+            "ruler-tick detection, with a fixed fallback of %.4f mm/px.",
+            cfg.DEFAULT_MM_PER_PIXEL,
+        )
+    return lookup
+
+
+def get_mm_per_pixel(image_id: str, image_path: str, lookup: Dict[str, float], cfg: Config) -> float:
+    if image_id in lookup:
+        return lookup[image_id]
+    return estimate_ruler_spacing(image_path, cfg.DEFAULT_MM_PER_PIXEL)
+
+
+# ---------------------------------------------------------------------------
+# Geometry: mask -> (pa_deg, fl_mm, mt_mm)
+# ---------------------------------------------------------------------------
+def _skeletonize(binary_mask: np.ndarray) -> np.ndarray:
+    if HAS_SKIMAGE:
+        return skimage_morphology.skeletonize(binary_mask > 0)
+    # Cheap fallback: thin via repeated erosion (coarser than true
+    # skeletonization but keeps the pipeline functional offline).
+    mask = (binary_mask > 0).astype(np.uint8)
+    kernel = np.ones((3, 3), np.uint8)
+    thinned = cv2.erode(mask, kernel, iterations=1)
+    return thinned > 0
+
+
+def _fit_line_angle_and_points(ys: np.ndarray, xs: np.ndarray) -> Tuple[float, float, float]:
+    """Fit a line to a point set, returning (slope, intercept_x, intercept_y)
+    via cv2.fitLine for numerical stability on near-vertical lines."""
+    pts = np.column_stack((xs, ys)).astype(np.float32)
+    vx, vy, cx, cy = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+    slope = float(vy) / (float(vx) + 1e-8)
+    return slope, float(cx), float(cy)
+
+
+def extract_architecture_parameters(
+    apo_mask: np.ndarray,
+    fasc_mask: np.ndarray,
+    cfg: Config,
+) -> Tuple[float, float, float]:
+    """Given binary aponeurosis and fascicle masks at the ORIGINAL image
+    resolution, compute (pa_deg, fl_mm_in_pixels, mt_mm_in_pixels) -- the
+    caller applies the mm-per-pixel calibration afterwards. Returns
+    physiologically clipped fallback values if the masks do not contain
+    enough structure to measure.
+    """
+    h, w = apo_mask.shape
+
+    # --- Aponeuroses: pick the two largest connected components ------------
+    num_labels_a, labels_a, stats_a, _ = cv2.connectedComponentsWithStats(
+        apo_mask.astype(np.uint8), connectivity=8
+    )
+    areas_a = sorted(
+        ((i, stats_a[i, cv2.CC_STAT_AREA]) for i in range(1, num_labels_a)),
+        key=lambda t: t[1], reverse=True,
+    )
+
+    mt_pixels = 0.0
+    slope_deep = 0.0
+    have_apo = len(areas_a) >= 2
+
+    if have_apo:
+        l1, l2 = areas_a[0][0], areas_a[1][0]
+        skel1 = _skeletonize(labels_a == l1)
+        skel2 = _skeletonize(labels_a == l2)
+        y1, x1 = np.where(skel1)
+        y2, x2 = np.where(skel2)
+
+        if len(y1) >= 2 and len(y2) >= 2:
+            s1, cx1, cy1 = _fit_line_angle_and_points(y1, x1)
+            s2, cx2, cy2 = _fit_line_angle_and_points(y2, x2)
+
+            mid_x = w / 2.0
+            y_mid_1 = s1 * (mid_x - cx1) + cy1
+            y_mid_2 = s2 * (mid_x - cx2) + cy2
+            mt_pixels = abs(y_mid_1 - y_mid_2)
+            slope_deep = s1 if y_mid_1 > y_mid_2 else s2
+        else:
+            have_apo = False
+
+    # --- Fascicles: weighted average orientation of top components ---------
+    fasc_skel = (_skeletonize(fasc_mask > 0)).astype(np.uint8)
+    num_labels_f, labels_f, stats_f, _ = cv2.connectedComponentsWithStats(fasc_skel, connectivity=8)
+
+    abs_angles, rel_angles, weights = [], [], []
+    for i in range(1, num_labels_f):
+        if stats_f[i, cv2.CC_STAT_AREA] <= cfg.FASC_MIN_COMPONENT_AREA:
+            continue
+        yf, xf = np.where(labels_f == i)
+        if len(yf) < cfg.FASC_MIN_COMPONENT_AREA:
+            continue
+        slope_f, _, _ = _fit_line_angle_and_points(yf, xf)
+
+        abs_angle = abs(math.degrees(math.atan(slope_f)))
+        rel_tan = abs((slope_f - slope_deep) / (1 + slope_f * slope_deep + 1e-8))
+        rel_angle = math.degrees(math.atan(rel_tan))
+
+        abs_angles.append(abs_angle)
+        rel_angles.append(rel_angle)
+        weights.append(len(yf))
+
+    if abs_angles:
+        order = np.argsort(weights)[::-1][:3]
+        top_w = np.array(weights)[order]
+        pa_deg_abs = float(np.average(np.array(abs_angles)[order], weights=top_w))
+        pa_deg_rel = float(np.average(np.array(rel_angles)[order], weights=top_w))
+    else:
+        pa_deg_abs = abs(math.degrees(math.atan(slope_deep))) + 15.0 if have_apo else cfg.FALLBACK_PA_DEG
+        pa_deg_rel = 15.0
+
+    pa_deg_rel = float(np.clip(pa_deg_rel, cfg.PA_MIN_DEG, cfg.PA_MAX_DEG))
+    pa_deg_abs = float(np.clip(pa_deg_abs, 0.0, 90.0))
+
+    if mt_pixels > 0:
+        fl_pixels = mt_pixels / math.sin(math.radians(pa_deg_rel))
+    else:
+        fl_pixels = 0.0
+
+    if not have_apo or mt_pixels <= 0:
+        return cfg.FALLBACK_PA_DEG, None, None  # caller substitutes mm fallbacks
+
+    return pa_deg_abs, fl_pixels, mt_pixels
+
+
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def predict_masks_batched(
+    model: "nn.Module",
+    records: List[Tuple[str, str]],
+    cfg: Config,
+    threshold: float,
+    use_tta: bool,
+) -> Dict[str, Tuple[np.ndarray, int, int]]:
+    """Runs batched inference for one model over all test images.
+    Returns {image_id: (binary_mask_at_original_resolution, orig_h, orig_w)}."""
+    dataset = TestImageDataset(records, cfg.IMG_SIZE)
+    loader = DataLoader(
+        dataset, batch_size=cfg.INFER_BATCH_SIZE, shuffle=False,
+        num_workers=cfg.NUM_WORKERS, pin_memory=(DEVICE.type == "cuda"),
+    )
+
+    outputs: Dict[str, Tuple[np.ndarray, int, int]] = {}
+    use_amp = DEVICE.type == "cuda"
+
+    for batch_imgs, orig_hs, orig_ws, image_ids, _paths in loader:
+        batch_imgs = batch_imgs.to(DEVICE, non_blocking=True)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            logits = model(batch_imgs)
+            probs = torch.sigmoid(logits)
+            if use_tta:
+                flipped_logits = model(torch.flip(batch_imgs, dims=[3]))
+                flipped_probs = torch.flip(torch.sigmoid(flipped_logits), dims=[3])
+                probs = (probs + flipped_probs) / 2.0
+
+        probs = probs.squeeze(1).float().cpu().numpy()
+
+        for i in range(probs.shape[0]):
+            image_id = image_ids[i]
+            orig_h, orig_w = int(orig_hs[i]), int(orig_ws[i])
+            if orig_h <= 0 or orig_w <= 0:
+                outputs[image_id] = (None, 0, 0)
+                continue
+            mask_small = (probs[i] > threshold).astype(np.uint8) * 255
+            mask_orig = cv2.resize(mask_small, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+            outputs[image_id] = (mask_orig, orig_h, orig_w)
+
+    del loader, dataset
+    gc.collect()
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+    return outputs
+
+
+def match_test_file(image_id: str, candidates_by_key: Dict[str, str]) -> Optional[str]:
+    """Robustly resolve a sample-submission image_id to an actual file on
+    disk, tolerating extension and case/prefix differences (the sample
+    submission may reference IDs like 'image_00001' while files on disk
+    are named e.g. 'IMG_00001.tif')."""
+    if image_id in candidates_by_key:
+        return candidates_by_key[image_id]
+
+    stem = os.path.splitext(image_id)[0]
+    variants = {
+        stem,
+        stem.lower(),
+        stem.upper(),
+        stem.replace("image_", "IMG_"),
+        stem.replace("IMG_", "image_"),
+        stem.replace("image", "IMG"),
+        stem.replace("IMG", "image"),
+    }
+    for v in variants:
+        if v in candidates_by_key:
+            return candidates_by_key[v]
+    return None
+
+
+def run_inference(base_dir: str, cfg: Config,
+                   apo_ckpt: str, fasc_ckpt: str) -> "pd.DataFrame":
+    test_dir = find_directory(base_dir, "test")
+    test_paths = list_images_recursive(test_dir) if test_dir else []
+    if not test_paths:
+        raise FileNotFoundError(f"No test images found under {base_dir} (looked for a 'test*' folder).")
+
+    logger.info("Found %d test images under %s", len(test_paths), test_dir)
+
+    candidates_by_key: Dict[str, str] = {}
+    for p in test_paths:
+        stem = os.path.splitext(os.path.basename(p))[0]
+        candidates_by_key[os.path.basename(p)] = p
+        candidates_by_key.setdefault(stem, p)
+
+    sample_sub, delimiter = load_sample_submission(base_dir)
+    if sample_sub is not None and "image_id" in sample_sub.columns:
+        required_ids = sample_sub["image_id"].astype(str).tolist()
+        output_columns = list(sample_sub.columns)
+    else:
+        required_ids = [os.path.splitext(os.path.basename(p))[0] for p in test_paths]
+        output_columns = ["image_id", "pa_deg", "fl_mm", "mt_mm"]
+
+    records: List[Tuple[str, str]] = []
+    unresolved = 0
+    for image_id in required_ids:
+        path = match_test_file(image_id, candidates_by_key)
+        if path is None:
+            unresolved += 1
+            continue
+        records.append((path, image_id))
+
+    if unresolved:
+        logger.warning(
+            "%d/%d required image_ids could not be matched to a file on disk; "
+            "fallback predictions will be used for those rows.",
+            unresolved, len(required_ids),
+        )
+
+    apo_model = load_model_checkpoint(apo_ckpt)
+    fasc_model = load_model_checkpoint(fasc_ckpt)
+
+    logger.info("Running batched segmentation inference (aponeurosis model)...")
+    apo_results = predict_masks_batched(apo_model, records, cfg, cfg.APO_MASK_THRESHOLD, cfg.USE_TTA)
+    del apo_model
+    gc.collect()
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+
+    logger.info("Running batched segmentation inference (fascicle model)...")
+    fasc_results = predict_masks_batched(fasc_model, records, cfg, cfg.FASC_MASK_THRESHOLD, cfg.USE_TTA)
+    del fasc_model
+    gc.collect()
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+
+    calibration_lookup = build_calibration_lookup(base_dir, cfg)
+
+    resolved_ids = {image_id for _, image_id in records}
+    path_by_id = {image_id: path for path, image_id in records}
+
+    rows = []
+    n_fallback = 0
+    for image_id in required_ids:
+        if image_id not in resolved_ids:
+            rows.append({
+                "image_id": image_id,
+                "pa_deg": cfg.FALLBACK_PA_DEG,
+                "fl_mm": cfg.FALLBACK_FL_MM,
+                "mt_mm": cfg.FALLBACK_MT_MM,
+            })
+            n_fallback += 1
+            continue
+
+        apo_mask, oh, ow = apo_results.get(image_id, (None, 0, 0))
+        fasc_mask, _, _ = fasc_results.get(image_id, (None, 0, 0))
+
+        if apo_mask is None or fasc_mask is None or oh == 0 or ow == 0:
+            rows.append({
+                "image_id": image_id,
+                "pa_deg": cfg.FALLBACK_PA_DEG,
+                "fl_mm": cfg.FALLBACK_FL_MM,
+                "mt_mm": cfg.FALLBACK_MT_MM,
+            })
+            n_fallback += 1
+            continue
+
+        try:
+            pa_deg, fl_pixels, mt_pixels = extract_architecture_parameters(apo_mask, fasc_mask, cfg)
+        except Exception as exc:
+            logger.warning("Geometry extraction failed for %s (%s); using fallback values.", image_id, exc)
+            pa_deg, fl_pixels, mt_pixels = cfg.FALLBACK_PA_DEG, None, None
+
+        if fl_pixels is None or mt_pixels is None:
+            rows.append({
+                "image_id": image_id,
+                "pa_deg": round(float(pa_deg), 3),
+                "fl_mm": cfg.FALLBACK_FL_MM,
+                "mt_mm": cfg.FALLBACK_MT_MM,
+            })
+            n_fallback += 1
+            continue
+
+        mm_per_px = get_mm_per_pixel(image_id, path_by_id[image_id], calibration_lookup, cfg)
+        mt_mm = float(np.clip(mt_pixels * mm_per_px, cfg.MT_MIN_MM, cfg.MT_MAX_MM))
+        fl_mm = float(np.clip(fl_pixels * mm_per_px, cfg.FL_MIN_MM, cfg.FL_MAX_MM))
+
+        rows.append({
+            "image_id": image_id,
+            "pa_deg": round(float(pa_deg), 3),
+            "fl_mm": round(fl_mm, 3),
+            "mt_mm": round(mt_mm, 3),
+        })
+
+    if n_fallback:
+        logger.warning("%d/%d rows used fallback predictions (unreadable image or empty masks).",
+                        n_fallback, len(required_ids))
+
+    result_df = pd.DataFrame(rows)
+    if "image_id" in output_columns and set(output_columns) - {"image_id", "pa_deg", "fl_mm", "mt_mm"}:
+        # Preserve any extra columns present in a non-standard sample submission.
+        for col in output_columns:
+            if col not in result_df.columns:
+                result_df[col] = sample_sub[col].values if sample_sub is not None else np.nan
+    result_df = result_df[[c for c in output_columns if c in result_df.columns]]
+
+    return result_df, delimiter, sample_sub
+
+
+# ---------------------------------------------------------------------------
+# Submission validation & writing
+# ---------------------------------------------------------------------------
+def validate_submission(df: "pd.DataFrame", sample_sub: Optional["pd.DataFrame"]) -> None:
+    required_cols = {"image_id", "pa_deg", "fl_mm", "mt_mm"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Submission is missing required columns: {missing}")
+
+    if df["image_id"].duplicated().any():
+        raise ValueError("Submission contains duplicate image_id values.")
+
+    numeric_cols = ["pa_deg", "fl_mm", "mt_mm"]
+    if df[numeric_cols].isna().any().any():
+        raise ValueError("Submission contains NaN values in prediction columns.")
+
+    if not np.isfinite(df[numeric_cols].to_numpy(dtype=float)).all():
+        raise ValueError("Submission contains non-finite (inf) values in prediction columns.")
+
+    if sample_sub is not None and "image_id" in sample_sub.columns:
+        expected_ids = set(sample_sub["image_id"].astype(str))
+        actual_ids = set(df["image_id"].astype(str))
+        if expected_ids != actual_ids:
+            missing_ids = expected_ids - actual_ids
+            extra_ids = actual_ids - expected_ids
+            raise ValueError(
+                f"image_id mismatch vs sample_submission: "
+                f"{len(missing_ids)} missing, {len(extra_ids)} unexpected."
+            )
+        if len(df) != len(sample_sub):
+            raise ValueError(
+                f"Row count mismatch: submission has {len(df)} rows, "
+                f"sample_submission has {len(sample_sub)} rows."
+            )
+
+    logger.info("Submission validation passed: %d rows, columns=%s", len(df), list(df.columns))
+
+
+def write_submission(df: "pd.DataFrame", path: str, delimiter: str) -> None:
+    df.to_csv(path, index=False, sep=delimiter)
+    logger.info("Submission written to %s (delimiter=%r)", path, delimiter)
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+def main() -> None:
+    start_time = time.time()
+    logger.info("Device: %s", DEVICE)
+
+    try:
+        base_dir = resolve_base_dir(CFG.BASE_DIR)
+    except FileNotFoundError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
+
+    apo_img_dir = find_directory(base_dir, "apo_img")
+    apo_mask_dir = find_directory(base_dir, "apo_mask")
+    fasc_img_dir = find_directory(base_dir, "fasc_img")
+    fasc_mask_dir = find_directory(base_dir, "fasc_mask")
+
+    apo_imgs, apo_masks = match_image_mask_pairs(apo_img_dir, apo_mask_dir)
+    fasc_imgs, fasc_masks = match_image_mask_pairs(fasc_img_dir, fasc_mask_dir)
+    logger.info("Matched pairs -> aponeurosis: %d, fascicle: %d", len(apo_imgs), len(fasc_imgs))
+
+    test_dir = find_directory(base_dir, "test")
+    test_imgs = list_images_recursive(test_dir) if test_dir else []
+    logger.info("Test images found: %d", len(test_imgs))
+
+    if CFG.RUN_EDA:
+        try:
+            run_eda(apo_imgs, apo_masks, fasc_imgs, fasc_masks, test_imgs, CFG.EDA_DIR)
+        except Exception as exc:
+            logger.warning("EDA stage failed and was skipped: %s", exc)
+
+    apo_ckpt = os.path.join(CFG.MODEL_DIR, "best_aponeurosis_unet.pth")
+    fasc_ckpt = os.path.join(CFG.MODEL_DIR, "best_fascicle_unet.pth")
+
+    if CFG.RUN_TRAINING:
+        # Remove exact-duplicate training images (see competition discussion
+        # notice) so the internal validation split is not contaminated.
+        apo_imgs_dedup, apo_masks_dedup, n_dupe_apo = deduplicate_pairs(apo_imgs, apo_masks)
+        fasc_imgs_dedup, fasc_masks_dedup, n_dupe_fasc = deduplicate_pairs(fasc_imgs, fasc_masks)
+        if n_dupe_apo or n_dupe_fasc:
+            logger.info("Removed %d duplicate aponeurosis and %d duplicate fascicle training pairs.",
+                        n_dupe_apo, n_dupe_fasc)
+
+        try:
+            apo_ckpt = train_segmentation_model("aponeurosis", apo_imgs_dedup, apo_masks_dedup, CFG)
+        except Exception as exc:
+            logger.error("Aponeurosis model training failed: %s", exc)
+
+        try:
+            fasc_ckpt = train_segmentation_model("fascicle", fasc_imgs_dedup, fasc_masks_dedup, CFG)
+        except Exception as exc:
+            logger.error("Fascicle model training failed: %s", exc)
+    else:
+        logger.info("RUN_TRAINING=False -> skipping training, using existing checkpoints if present.")
+
+    try:
+        submission_df, delimiter, sample_sub = run_inference(base_dir, CFG, apo_ckpt, fasc_ckpt)
+    except Exception as exc:
+        logger.error("Inference failed: %s", exc)
+        sys.exit(1)
+
+    try:
+        validate_submission(submission_df, sample_sub)
+    except ValueError as exc:
+        logger.error("Submission failed validation: %s", exc)
+        sys.exit(1)
+
+    write_submission(submission_df, CFG.OUTPUT_CSV, delimiter)
+
+    elapsed_min = (time.time() - start_time) / 60.0
+    logger.info("Pipeline complete in %.1f minutes.", elapsed_min)
+    logger.info("Preview:\n%s", submission_df.head().to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
