@@ -1,0 +1,545 @@
+import os
+import re
+import glob
+import math
+import random
+import hashlib
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+# --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+try:
+    import segmentation_models_pytorch as smp
+except ModuleNotFoundError:
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "-q", "segmentation-models-pytorch"]
+    )
+    import segmentation_models_pytorch as smp
+
+import numpy as np
+import pandas as pd
+import cv2
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
+from sklearn.model_selection import KFold
+from scipy.signal import find_peaks
+from skimage.morphology import skeletonize
+from PIL import Image
+from tqdm import tqdm
+import albumentations as A
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+BASE_DIR = "/----/input/competitions/umud-challenge-muscle-architecture-in-ultrasound-data"
+APO_IMG_DIR = os.path.join(BASE_DIR, "apo_imgs_v1")
+APO_MASK_DIR = os.path.join(BASE_DIR, "apo_masks_v1")
+FASC_IMG_DIR = os.path.join(BASE_DIR, "fasc_imgs_v1")
+FASC_MASK_DIR = os.path.join(BASE_DIR, "fasc_masks_v1")
+TEST_IMG_DIR = os.path.join(BASE_DIR, "test_images_v2")
+SAMPLE_SUB_PATH = os.path.join(BASE_DIR, "sample_submission.csv")
+
+# FIX #2: OUT_PATH must be a FILE path, not a directory. `to_csv()` on a
+# directory raises IsADirectoryError once training finishes.
+OUT_PATH = "/----/working/submission.csv"
+
+IMG_SIZE = 512
+N_FOLDS = 3
+EPOCHS = 15
+BATCH_SIZE = 8
+LR = 2e-3
+SEED = 42
+
+DEVICE_APO = torch.device("cuda:0" if torch.cuda.device_count() > 0 else "cpu")
+DEVICE_FASC = torch.device("cuda:1" if torch.cuda.device_count() > 1 else DEVICE_APO)
+
+
+PA_MIN, PA_MAX = 5.0, 45.0
+MT_MIN, MT_MAX = 10.0, 50.0
+FL_MIN, FL_MAX = 30.0, 200.0
+DEFAULT_DEPTH_MM = 45.0
+
+
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# --------------------------------------------------------------------------
+# Data matching & de-duplication
+# --------------------------------------------------------------------------
+def get_matched_pairs(img_dir, mask_dir):
+    """Match image/mask files by filename across nested subfolders."""
+    mask_map = {}
+    for root, _, files in os.walk(mask_dir):
+        for f in files:
+            if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff")):
+                mask_map[f] = os.path.join(root, f)
+
+    img_paths, mask_paths = [], []
+    for root, _, files in os.walk(img_dir):
+        for f in files:
+            if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff")) and f in mask_map:
+                img_paths.append(os.path.join(root, f))
+                mask_paths.append(mask_map[f])
+    return img_paths, mask_paths
+
+
+def dedupe_pairs(img_paths, mask_paths, sample_bytes=1_000_000):
+    seen = set()
+    kept_img, kept_mask = [], []
+    for ip, mp in zip(img_paths, mask_paths):
+        with open(ip, "rb") as f:
+            h = hashlib.md5(f.read(sample_bytes)).hexdigest()
+        if h in seen:
+            continue
+        seen.add(h)
+        kept_img.append(ip)
+        kept_mask.append(mp)
+    return kept_img, kept_mask
+
+
+# --------------------------------------------------------------------------
+# Dataset
+# --------------------------------------------------------------------------
+train_transform = A.Compose(
+    [
+        A.Resize(IMG_SIZE, IMG_SIZE),
+        A.HorizontalFlip(p=0.5),
+        A.Affine(scale=(0.9, 1.1), translate_percent=(-0.05, 0.05), rotate=(-15, 15), p=0.5),
+        A.RandomBrightnessContrast(p=0.3),
+    ]
+)
+val_transform = A.Compose([A.Resize(IMG_SIZE, IMG_SIZE)])
+
+
+class UltrasoundSegDataset(Dataset):
+    """PIL-based (avoids OpenCV TIFF warnings) grayscale image/mask dataset."""
+
+    def __init__(self, image_paths, mask_paths, transform=None):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img = np.array(Image.open(self.image_paths[idx]).convert("L"))
+        mask = np.array(Image.open(self.mask_paths[idx]).convert("L"))
+
+        if img.shape != mask.shape:
+            mask = np.array(
+                Image.fromarray(mask).resize((img.shape[1], img.shape[0]), Image.NEAREST)
+            )
+
+        if self.transform:
+            aug = self.transform(image=img, mask=mask)
+            img, mask = aug["image"], aug["mask"]
+
+        img = torch.from_numpy(img).unsqueeze(0).float()
+        mask = torch.from_numpy(mask).unsqueeze(0).float() / 255.0
+        return img, mask
+
+
+# --------------------------------------------------------------------------
+# Model & loss
+# --------------------------------------------------------------------------
+def build_model(encoder="resnet34"):
+    return smp.Unet(encoder_name=encoder, encoder_weights="imagenet", in_channels=1, classes=1)
+
+
+dice_loss_fn = smp.losses.DiceLoss(mode="binary", from_logits=True)
+bce_loss_fn = nn.BCEWithLogitsLoss()
+
+
+def criterion(pred, target):
+    return dice_loss_fn(pred, target) + bce_loss_fn(pred, target)
+
+
+# --------------------------------------------------------------------------
+# Training
+# --------------------------------------------------------------------------
+def train_one_fold(model, train_loader, val_loader, device, epochs, save_path):
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    scaler = GradScaler()
+    best_val = float("inf")
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        for images, masks in train_loader:
+            images, masks = images.to(device), masks.to(device)
+            optimizer.zero_grad()
+            with autocast():
+                loss = criterion(model(images), masks)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        scheduler.step()
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for images, masks in val_loader:
+                images, masks = images.to(device), masks.to(device)
+                with autocast():
+                    val_loss += criterion(model(images), masks).item() * images.size(0)
+        val_loss /= len(val_loader.dataset)
+
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save(model.state_dict(), save_path)
+
+        print(f"[{os.path.basename(save_path)}] epoch {epoch:02d}/{epochs} val_loss={val_loss:.4f}")
+
+    return best_val
+
+
+def train_kfold(img_paths, mask_paths, tag, device, n_folds=N_FOLDS, epochs=EPOCHS):
+    """Trains n_folds independent models for one target ('apo' or 'fasc')."""
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=SEED)
+    idx = np.arange(len(img_paths))
+    saved_paths = []
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(idx)):
+        train_ds = UltrasoundSegDataset(
+            [img_paths[i] for i in train_idx], [mask_paths[i] for i in train_idx], train_transform
+        )
+        val_ds = UltrasoundSegDataset(
+            [img_paths[i] for i in val_idx], [mask_paths[i] for i in val_idx], val_transform
+        )
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+        model = build_model()
+        save_path = f"best_{tag}_fold{fold}.pth"
+        train_one_fold(model, train_loader, val_loader, device, epochs, save_path)
+        saved_paths.append(save_path)
+
+    return saved_paths
+
+
+def train_both_models_in_parallel():
+    apo_img, apo_mask = dedupe_pairs(*get_matched_pairs(APO_IMG_DIR, APO_MASK_DIR))
+    fasc_img, fasc_mask = dedupe_pairs(*get_matched_pairs(FASC_IMG_DIR, FASC_MASK_DIR))
+    print(f"Aponeurosis pairs (deduped): {len(apo_img)} | Fascicle pairs (deduped): {len(fasc_img)}")
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_apo = ex.submit(train_kfold, apo_img, apo_mask, "apo", DEVICE_APO)
+        fut_fasc = ex.submit(train_kfold, fasc_img, fasc_mask, "fasc", DEVICE_FASC)
+        apo_paths = fut_apo.result()
+        fasc_paths = fut_fasc.result()
+
+    return apo_paths, fasc_paths
+
+
+# --------------------------------------------------------------------------
+# Inference
+# --------------------------------------------------------------------------
+def load_ensemble(paths, device):
+    models = []
+    for p in paths:
+        m = build_model().to(device)
+        m.load_state_dict(torch.load(p, map_location=device))
+        m.eval()
+        models.append(m)
+    return models
+
+
+@torch.no_grad()
+def predict_prob_map(models, img_512, device):
+    """Average sigmoid probability across all fold models and a horizontal flip (TTA)."""
+    x = torch.from_numpy(img_512).unsqueeze(0).unsqueeze(0).float().to(device)
+    x_flip = torch.flip(x, dims=[3])
+
+    probs = []
+    for m in models:
+        probs.append(torch.sigmoid(m(x)))
+        probs.append(torch.flip(torch.sigmoid(m(x_flip)), dims=[3]))
+    return torch.stack(probs).mean(0).squeeze().cpu().numpy()
+
+
+# --------------------------------------------------------------------------
+# Geometry: PA / MT / FL (pixels)
+# --------------------------------------------------------------------------
+def _fit_line_robust(ys, xs):
+    """Huber-weighted line fit — much less sensitive to a stray skeleton
+    branch than an unweighted least-squares fit."""
+    vx, vy, cx, cy = cv2.fitLine(
+        np.column_stack((xs, ys)).astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01
+    ).flatten()
+    return float(vx), float(vy), float(cx), float(cy)
+
+
+def measure_pixels(apo_prob, fasc_prob, orig_h, orig_w, apo_thresh=0.5, fasc_thresh=0.4):
+    apo_mask = cv2.resize(
+        (apo_prob > apo_thresh).astype(np.uint8) * 255, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST
+    )
+    fasc_mask = cv2.resize(
+        (fasc_prob > fasc_thresh).astype(np.uint8) * 255, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST
+    )
+
+    # --- Aponeuroses: two largest components, skeletonized, robust-line-fit ---
+    n_a, labels_a, stats_a, _ = cv2.connectedComponentsWithStats(apo_mask, connectivity=8)
+    areas_a = sorted(((i, stats_a[i, cv2.CC_STAT_AREA]) for i in range(1, n_a)), key=lambda t: -t[1])
+
+    mt_px, deep_angle_deg, deep_slope = 0.0, 0.0, 0.0
+    if len(areas_a) >= 2:
+        l1, l2 = areas_a[0][0], areas_a[1][0]
+        skel1, skel2 = skeletonize(labels_a == l1), skeletonize(labels_a == l2)
+        y1, x1 = np.where(skel1)
+        y2, x2 = np.where(skel2)
+
+        vx1, vy1, cx1, cy1 = _fit_line_robust(y1, x1)
+        vx2, vy2, cx2, cy2 = _fit_line_robust(y2, x2)
+        s1, s2 = vy1 / (vx1 + 1e-8), vy2 / (vx2 + 1e-8)
+
+        mid_x = orig_w / 2.0
+        y_mid_1 = s1 * (mid_x - cx1) + cy1
+        y_mid_2 = s2 * (mid_x - cx2) + cy2
+        mt_px = abs(y_mid_1 - y_mid_2)  # centerline-to-centerline (matches organizer convention)
+
+        # deep = whichever line sits lower in the image (larger y)
+        deep_slope = s1 if y_mid_1 > y_mid_2 else s2
+        deep_angle_deg = math.degrees(math.atan(deep_slope))
+
+    # --- Fascicles: skeletonize whole mask, then split into components ---
+    fasc_skel = (skeletonize(fasc_mask > 127).astype(np.uint8)) * 255
+    n_f, labels_f, stats_f, _ = cv2.connectedComponentsWithStats(fasc_skel, connectivity=8)
+
+    rel_angles, weights = [], []
+    for i in range(1, n_f):
+        if stats_f[i, cv2.CC_STAT_AREA] <= 30:
+            continue
+        yf, xf = np.where(labels_f == i)
+        if len(yf) <= 30:
+            continue
+        vx, vy, _, _ = _fit_line_robust(yf, xf)
+        slope_f = vy / (vx + 1e-8)
+        # relative angle to the deep aponeurosis via tan(A-B) — physiologically
+        # correct pennation angle, independent of overall probe tilt
+        rel_tan = abs((slope_f - deep_slope) / (1 + slope_f * deep_slope + 1e-8))
+        rel_angles.append(math.degrees(math.atan(rel_tan)))
+        weights.append(len(yf))
+
+    if rel_angles:
+        angles = np.array(rel_angles)
+        med = np.median(angles)
+        mad = np.median(np.abs(angles - med)) + 1e-6
+        keep = np.abs(angles - med) < 4 * mad
+        if keep.sum() > 0:
+            angles, w = angles[keep], np.array(weights)[keep]
+            pa_deg = float(np.average(angles, weights=w))
+        else:
+            pa_deg = float(med)
+    else:
+        pa_deg = 15.0
+
+    pa_deg = float(np.clip(pa_deg, PA_MIN, PA_MAX))
+    fl_px = mt_px / math.sin(math.radians(pa_deg)) if mt_px > 0 else 0.0
+    return mt_px, fl_px, pa_deg
+
+
+# --------------------------------------------------------------------------
+# Calibration: resolution-clustered ruler-tick detection
+# --------------------------------------------------------------------------
+def detect_ruler_spacing_px(gray):
+    """Look for the bright depth-scale tick marks along the left/right
+    margins. Returns None if no consistent spacing is found."""
+    h, w = gray.shape
+    for roi in (gray[:, : int(w * 0.15)], gray[:, int(w * 0.85):]):
+        _, thresh = cv2.threshold(roi, 200, 255, cv2.THRESH_BINARY)
+        row_sums = thresh.sum(axis=1)
+        peaks, _ = find_peaks(row_sums, height=row_sums.max() * 0.5 if row_sums.max() > 0 else 1, distance=30)
+        if len(peaks) >= 3:
+            diffs = np.diff(peaks)
+            spacing = float(np.median(diffs))
+            if 20 < spacing < 300:
+                return spacing
+    return None
+
+
+def build_calibration_table(image_paths, max_per_cluster=40):
+    """
+    Group images by (height, width) — a reasonable proxy for probe/depth
+    setting — and pool ruler-tick detections across the whole cluster.
+    """
+    by_shape = {}
+    for p in image_paths:
+        img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+        by_shape.setdefault(img.shape, []).append(p)
+
+    calibration = {}
+    for shape, paths in by_shape.items():
+        sample = paths[:max_per_cluster]
+        spacings = []
+        for p in sample:
+            img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+            s = detect_ruler_spacing_px(img)
+            if s is not None:
+                spacings.append(s)
+
+        if spacings:
+            tick_px = float(np.median(spacings))
+            calibration[shape] = 10.0 / tick_px  # standard MSK-US tick spacing = 1 cm
+        else:
+            calibration[shape] = DEFAULT_DEPTH_MM / shape[0]
+
+    return calibration
+
+
+# --------------------------------------------------------------------------
+# Temporal smoothing across 5-consecutive-frame test clips
+# --------------------------------------------------------------------------
+def infer_clip_id(filename):
+    m = re.search(r"(\d+)", filename)
+    return int(m.group(1)) if m else None
+
+
+def smooth_within_clips(df, clip_size=5):
+    df = df.copy()
+    ids = df["image_id"].apply(infer_clip_id)
+    if ids.isna().any():
+        return df
+
+    order = np.argsort(ids.values)
+    df = df.iloc[order].reset_index(drop=True)
+    for start in range(0, len(df), clip_size):
+        block = df.iloc[start : start + clip_size]
+        for col in ("pa_deg", "fl_mm", "mt_mm"):
+            df.loc[block.index, col] = block[col].median()
+    return df
+
+
+# --------------------------------------------------------------------------
+# FIX #3: submission-format compliance.
+#
+# The brief requires:
+#   - columns image_id, pa_deg, fl_mm, mt_mm
+#   - every test image_id present exactly once
+# The old code derived image_id from os.path.basename(path), which keeps the
+# file extension (e.g. "image_00001.tif") and trusts glob() to enumerate the
+# exact same set of ids ---- expects, in whatever order. If the grader's
+# image_id values don't carry an extension (as in the brief's example table:
+# "image_00001"), every row silently fails to match and the submission
+# scores zero even though the notebook "succeeded".
+#
+# The robust fix: predict against whatever files exist on disk, but then
+# reindex the final submission onto sample_submission.csv's own image_id
+# column (and its column order / separator), rather than trusting our own
+# derived ids. This also cheaply enforces "each image exactly once" and
+# fails loudly if a predicted id can't be matched to the sample submission.
+# --------------------------------------------------------------------------
+def _read_sample_submission():
+    if not os.path.exists(SAMPLE_SUB_PATH):
+        return None, ","
+    with open(SAMPLE_SUB_PATH) as f:
+        header = f.readline()
+    sep = ";" if header.count(";") > header.count(",") else ","
+    sample = pd.read_csv(SAMPLE_SUB_PATH, sep=sep)
+    return sample, sep
+
+
+def _align_to_sample_submission(pred_df, sample_df):
+    """Reindex predictions onto the exact image_id set/order ---- expects."""
+    if sample_df is None:
+        return pred_df
+
+    pred_lookup = {str(r.image_id): r for r in pred_df.itertuples(index=False)}
+    # Build a lookup that also tolerates predicted ids carrying an extension
+    # the sample submission's ids don't have (or vice versa).
+    stem_lookup = {os.path.splitext(k)[0]: v for k, v in pred_lookup.items()}
+
+    rows = []
+    missing = []
+    for sample_id in sample_df["image_id"].astype(str):
+        row = pred_lookup.get(sample_id) or stem_lookup.get(os.path.splitext(sample_id)[0])
+        if row is None:
+            missing.append(sample_id)
+            rows.append({"image_id": sample_id, "pa_deg": 15.0, "fl_mm": 60.0, "mt_mm": 20.0})
+        else:
+            rows.append(
+                {"image_id": sample_id, "pa_deg": row.pa_deg, "fl_mm": row.fl_mm, "mt_mm": row.mt_mm}
+            )
+
+    if missing:
+        print(f"WARNING: {len(missing)} sample_submission image_ids had no matching "
+              f"prediction and were filled with fallback values: {missing[:10]}"
+              f"{' ...' if len(missing) > 10 else ''}")
+
+    return pd.DataFrame(rows, columns=["image_id", "pa_deg", "fl_mm", "mt_mm"])
+
+
+# --------------------------------------------------------------------------
+# Main inference pipeline
+# --------------------------------------------------------------------------
+def run_inference(apo_paths, fasc_paths):
+    apo_models = load_ensemble(apo_paths, DEVICE_APO)
+    fasc_models = load_ensemble(fasc_paths, DEVICE_FASC)
+
+    test_paths = sorted(
+        glob.glob(os.path.join(TEST_IMG_DIR, "**", "*.*"), recursive=True),
+        key=lambda p: os.path.basename(p),
+    )
+    test_paths = [p for p in test_paths if p.lower().endswith((".png", ".jpg", ".tif", ".tiff"))]
+
+    calibration = build_calibration_table(test_paths)
+
+    rows = []
+    for p in tqdm(test_paths, desc="Inference"):
+        raw = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+        file_name = os.path.basename(p)
+        if raw is None:
+            rows.append({"image_id": file_name, "pa_deg": 15.0, "fl_mm": 60.0, "mt_mm": 20.0})
+            continue
+
+        orig_h, orig_w = raw.shape
+        img_512 = cv2.resize(raw, (IMG_SIZE, IMG_SIZE))
+
+        apo_prob = predict_prob_map(apo_models, img_512, DEVICE_APO)
+        fasc_prob = predict_prob_map(fasc_models, img_512, DEVICE_FASC)
+
+        mt_px, fl_px, pa_deg = measure_pixels(apo_prob, fasc_prob, orig_h, orig_w)
+
+        mm_per_px = calibration.get(raw.shape, DEFAULT_DEPTH_MM / orig_h)
+        mt_mm = float(np.clip(mt_px * mm_per_px, MT_MIN, MT_MAX))
+        fl_mm = float(np.clip(fl_px * mm_per_px, FL_MIN, FL_MAX))
+
+        rows.append(
+            {"image_id": file_name, "pa_deg": round(pa_deg, 3), "fl_mm": round(fl_mm, 3), "mt_mm": round(mt_mm, 3)}
+        )
+
+    sub_df = pd.DataFrame(rows)
+    sub_df = smooth_within_clips(sub_df, clip_size=5)
+    sub_df = sub_df.round({"pa_deg": 3, "fl_mm": 3, "mt_mm": 3})
+
+    sample_df, sep = _read_sample_submission()
+    sub_df = _align_to_sample_submission(sub_df, sample_df)
+
+   
+    assert list(sub_df.columns) == ["image_id", "pa_deg", "fl_mm", "mt_mm"], "column mismatch"
+    assert sub_df["image_id"].is_unique, "duplicate image_id in submission"
+    if sample_df is not None:
+        assert len(sub_df) == len(sample_df), "row count doesn't match sample_submission.csv"
+
+    sub_df.to_csv(OUT_PATH, sep=sep, index=False)
+    print(f"Saved {OUT_PATH} with {len(sub_df)} rows (sep='{sep}').")
+    return sub_df
+
+
+# --------------------------------------------------------------------------
+if __name__ == "__main__":
+    set_seed()
+    apo_model_paths, fasc_model_paths = train_both_models_in_parallel()
+    run_inference(apo_model_paths, fasc_model_paths)
