@@ -8,9 +8,6 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-# --------------------------------------------------------------------------
-
-# --------------------------------------------------------------------------
 try:
     import segmentation_models_pytorch as smp
 except ModuleNotFoundError:
