@@ -310,7 +310,7 @@ def train_one_model(pairs, name, epochs=CFG.EPOCHS):
  
  
 # --------------------------------------------------------------------------- #
-# Inference helpers
+# Inference
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def predict_mask(model, img_path, img_size=CFG.IMG_SIZE, thresh=0.5):
