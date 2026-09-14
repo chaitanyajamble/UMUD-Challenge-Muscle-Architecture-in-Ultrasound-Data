@@ -1,519 +1,686 @@
-import os
-import glob
-import math
-import random
+# Environment Setup & Runtime Configuration
+import os, io, math, time, random, warnings
+from pathlib import Path
+from collections import defaultdict
+os.environ["PYTHONWARNINGS"] = "ignore"
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+import cv2
 import numpy as np
 import pandas as pd
-import cv2
+from PIL import Image
+from scipy.signal import savgol_filter
+np.seterr(all="ignore")
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from skimage.morphology import skeletonize
-from tqdm import tqdm
- 
-# --------------------------------------------------------------------------- #
-# Environment
-# --------------------------------------------------------------------------- #
-class CFG:
-    DATA_ROOT = "/----/input/competitions/umud-challenge-muscle-architecture-in-ultrasound-data"
-    APO_IMG_DIR = os.path.join(DATA_ROOT, "apo_imgs_v1", "apo_images_new_model_v1")
-    APO_MASK_DIR = os.path.join(DATA_ROOT, "apo_masks_v1", "apo_masks_new_model_v1")
-    FASC_IMG_DIR = os.path.join(DATA_ROOT, "fasc_imgs_v1", "fasc_images_new_model_v1")
-    FASC_MASK_DIR = os.path.join(DATA_ROOT, "fasc_masks_v1", "fasc_masks_new_model_v1")
-    TEST_IMG_DIR = os.path.join(DATA_ROOT, "test_images_v2", "test_set_v2")
-    SAMPLE_SUB = os.path.join(DATA_ROOT, "sample_submission.csv")
-    OUTPUT_SUB = "submission.csv"
- 
-    IMG_SIZE = 512         
-    BATCH_SIZE = 8
-    EPOCHS = 25
-    LR = 1e-3
-    VAL_FRAC = 0.15
-    SEED = 42
-    NUM_WORKERS = 2
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
- 
-  
-    PIXEL_SPACING_MM_PER_PX = 0.15
- 
- 
-def seed_everything(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
- 
- 
-seed_everything(CFG.SEED)
- 
- 
-def get_pixel_spacing(image_id: str) -> float:
-    
-    return CFG.PIXEL_SPACING_MM_PER_PX
- 
- 
-# --------------------------------------------------------------------------- #
-# Dataset
-# --------------------------------------------------------------------------- #
-IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
- 
- 
-def _index_by_stem(paths):
-    
-    index = {}
-    for p in paths:
-        stem = os.path.splitext(os.path.basename(p))[0]
-        index[stem] = p
-    return index
- 
- 
-def _strip_known_suffixes(stem):
-   
-    candidates = {stem}
-    for tok in ("_img", "_image", "img_", "image_", "_mask", "mask_", "_gt", "gt_"):
-        if stem.startswith(tok):
-            candidates.add(stem[len(tok):])
-        if stem.endswith(tok):
-            candidates.add(stem[: -len(tok)])
-    return candidates
- 
- 
-def list_pairs(img_dir, mask_dir):
-    """Match images to masks by filename stem, naming variations.
- 
-    Strategy (in order):
-      1. Exact stem match (image 'foo.png' <-> mask 'foo.png' or 'foo.<any_ext>').
-      2. Stem match after stripping common '_img'/'_mask'/etc. suffixes.
-      3. If neither yields any pairs but both folders have the same number of
-         files, fall back to positional pairing after sorting both lists
-         (works when files are consistently ordered/named e.g. 0001, 0002...).
-    """
-    img_paths = sorted([p for p in glob.glob(os.path.join(img_dir, "*"))
-                         if os.path.splitext(p)[1].lower() in IMG_EXTS])
-    mask_paths = sorted([p for p in glob.glob(os.path.join(mask_dir, "*"))
-                          if os.path.splitext(p)[1].lower() in IMG_EXTS])
- 
-    if not img_paths:
-        print(f"  [WARN] No image files found in {img_dir}")
+from torch.cuda.amp import autocast, GradScaler
+from sklearn.model_selection import KFold
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU Execution Mode"
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True  # fixed input size -> let cuDNN autotune conv kernels
+
+
+FAST_MODE = True
+
+IMG_SIZE   = 256
+if FAST_MODE:
+    N_FOLDS       = 3
+    EPOCHS        = 25   # aponeurosis branch (converges faster - thicker, higher-contrast structures)
+    PATIENCE      = 5
+    FASC_EPOCHS   = 50   # fascicle branch converges much slower (thin, low-contrast line masks)
+    FASC_PATIENCE = 10
+    BATCH_SIZE    = 16
+else:
+    N_FOLDS       = 5
+    EPOCHS        = 40
+    PATIENCE      = 8
+    FASC_EPOCHS   = 60
+    FASC_PATIENCE = 12
+    BATCH_SIZE    = 8
+LR = 2e-4
+
+print("+----------------------------------------------------------------+")
+print("| DUAL-BRANCH MORPHOMETRY RUNTIME INITIALIZED                    |")
+print("+----------------------------------------------------------------+")
+print(f"| Compute Hardware Platform : {DEVICE.type.upper():<34} |")
+print(f"| Physical Accelerator Model: {gpu_name:<34} |")
+print(f"| Fast Mode                 : {str(FAST_MODE):<34} |")
+print(f"| Folds per branch          : {N_FOLDS:<34} |")
+print(f"| Aponeurosis epochs/patience: {EPOCHS} / {PATIENCE:<27} |")
+print(f"| Fascicle epochs/patience   : {FASC_EPOCHS} / {FASC_PATIENCE:<27} |")
+print(f"| Image size / batch size   : {IMG_SIZE} / {BATCH_SIZE:<28} |")
+print("+----------------------------------------------------------------+")
+# Dataset Discovery & Paired DataLoader Construction
+CANDIDATE_ROOTS = [
+    Path("/----/input/competitions/umud-challenge-muscle-architecture-in-ultrasound-data"),
+    Path("/----/input/umud-challenge-muscle-architecture-in-ultrasound-data"),
+    Path("data/raw"),
+]
+DATA_DIR = next((p for p in CANDIDATE_ROOTS if p.exists()), None)
+if DATA_DIR is None:
+    raise FileNotFoundError("UMUD Challenge dataset mount point not found.")
+
+APO_IMG_DIR   = DATA_DIR / "apo_imgs_v1" / "apo_images_new_model_v1"
+APO_MASK_DIR  = DATA_DIR / "apo_masks_v1" / "apo_masks_new_model_v1"
+FASC_IMG_DIR  = DATA_DIR / "fasc_imgs_v1" / "fasc_images_new_model_v1"
+FASC_MASK_DIR = DATA_DIR / "fasc_masks_v1" / "fasc_masks_new_model_v1"
+TEST_DIR      = DATA_DIR / "test_images_v2" / "test_set_v2"
+SAMPLE_SUB    = DATA_DIR / "sample_submission.csv"
+
+VALID_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+
+def detect_delimiter(path):
+    """Sniff the field delimiter from a CSV's header line instead of assuming a comma -
+    some competition exports (like this one) ship semicolon-delimited files."""
+    with open(path, "r", newline="") as f:
+        first_line = f.readline()
+    candidates = [",", ";", "\t", "|"]
+    counts = {d: first_line.count(d) for d in candidates}
+    best = max(counts, key=counts.get)
+    return best if counts[best] > 0 else ","
+
+def read_csv_smart(path):
+    sep = detect_delimiter(path)
+    return pd.read_csv(path, sep=sep), sep
+
+def find_image_files(folder):
+    folder = Path(folder)
+    if not folder.exists():
         return []
-    if not mask_paths:
-        print(f"  [WARN] No mask files found in {mask_dir}")
-        return []
- 
-    mask_index = _index_by_stem(mask_paths)
- 
-    pairs = []
-    unmatched = []
-    for ip in img_paths:
-        stem = os.path.splitext(os.path.basename(ip))[0]
- 
-        # 1) exact stem match
-        if stem in mask_index:
-            pairs.append((ip, mask_index[stem]))
-            continue
- 
-       
-        found = None
-        img_candidates = _strip_known_suffixes(stem)
- 
-        for cand in img_candidates:
-            if cand in mask_index:
-                found = mask_index[cand]
-                break
- 
-        if found is None:
-            for mstem, mpath in mask_index.items():
-                mask_candidates = _strip_known_suffixes(mstem)
-                if img_candidates & mask_candidates:  # any overlap
-                    found = mpath
-                    break
- 
-        if found is not None:
-            pairs.append((ip, found))
-        else:
-            unmatched.append(ip)
- 
-   
-    if len(pairs) == 0 and len(img_paths) == len(mask_paths):
-        print(f"  [INFO] Falling back to positional (sorted-order) pairing for "
-              f"{img_dir} <-> {mask_dir} ({len(img_paths)} files each).")
-        pairs = list(zip(img_paths, mask_paths))
-        unmatched = []
- 
-    if unmatched:
-        print(f"  [WARN] {len(unmatched)}/{len(img_paths)} images in {img_dir} "
-              f"had no matching mask (showing up to 3): {unmatched[:3]}")
- 
-    return pairs
- 
- 
+    return sorted([p for p in folder.rglob("*")
+                   if p.is_file() and p.suffix.lower() in VALID_EXTS and not p.name.startswith(".")])
+
+def pair_images_masks(img_dir, mask_dir):
+    imgs = find_image_files(img_dir)
+    masks = find_image_files(mask_dir)
+    mask_map = {p.stem: p for p in masks}
+    return [(p, mask_map[p.stem]) for p in imgs if p.stem in mask_map]
+
+apo_pairs  = pair_images_masks(APO_IMG_DIR, APO_MASK_DIR)
+fasc_pairs = pair_images_masks(FASC_IMG_DIR, FASC_MASK_DIR)
+test_files = find_image_files(TEST_DIR)
+
+print(f"Aponeurosis image/mask pairs : {len(apo_pairs)}")
+print(f"Fascicle image/mask pairs    : {len(fasc_pairs)}")
+print(f"Test images                  : {len(test_files)}")
+if SAMPLE_SUB.exists():
+    _sample_preview, _sep = read_csv_smart(SAMPLE_SUB)
+    print(f"sample_submission.csv columns : {list(_sample_preview.columns)} "
+          f"(delimiter detected: {repr(_sep)})")
+
+if len(apo_pairs) == 0 or len(fasc_pairs) == 0 or len(test_files) == 0:
+    raise FileNotFoundError(
+        "One or more dataset directories were not found or are empty. "
+        "Check DATA_DIR / subfolder names against the competition's actual layout."
+    )
+# Segmentation Dataset & Augmentation
+def load_gray(path, size=IMG_SIZE):
+    with Image.open(path) as im:
+        arr = np.asarray(im.convert("L"), dtype=np.float32)
+    return cv2.resize(arr, (size, size), interpolation=cv2.INTER_AREA) / 255.0
+
+def load_mask(path, size=IMG_SIZE):
+    with Image.open(path) as im:
+        arr = np.asarray(im.convert("L"), dtype=np.float32)
+    resized = cv2.resize(arr, (size, size), interpolation=cv2.INTER_NEAREST)
+    return (resized > 127).astype(np.float32)
+
+def augment_pair(img, mask, rng):
+    if rng.random() < 0.5:
+        img, mask = img[:, ::-1].copy(), mask[:, ::-1].copy()
+    if rng.random() < 0.5:
+        angle, scale = rng.uniform(-12, 12), rng.uniform(0.92, 1.08)
+        h, w = img.shape
+        M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, scale)
+        img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        mask = cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
+    if rng.random() < 0.5:
+        gain, bias = rng.uniform(0.85, 1.15), rng.uniform(-0.06, 0.06)
+        img = np.clip(img * gain + bias, 0.0, 1.0)
+    if rng.random() < 0.3:
+        img = np.clip(img + rng.normal(0, 0.02, img.shape).astype(np.float32), 0.0, 1.0)
+    return img, mask
+
 class SegDataset(Dataset):
-    def __init__(self, pairs, img_size=512, augment=False):
-        self.pairs = pairs
-        self.img_size = img_size
-        self.augment = augment
- 
+    def __init__(self, pairs, size=IMG_SIZE, train=True, seed=0):
+        self.pairs, self.size, self.train = pairs, size, train
+        self.rng = np.random.default_rng(seed)
+
     def __len__(self):
         return len(self.pairs)
- 
+
     def __getitem__(self, idx):
         img_path, mask_path = self.pairs[idx]
-        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
- 
-        img = cv2.resize(img, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
-        mask = cv2.resize(mask, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
-        mask = (mask > 127).astype(np.float32)
- 
-        if self.augment:
-            if random.random() < 0.5:  # horizontal flip
-                img = np.fliplr(img).copy()
-                mask = np.fliplr(mask).copy()
-            if random.random() < 0.3:  # slight brightness jitter
-                img = np.clip(img.astype(np.float32) * random.uniform(0.85, 1.15), 0, 255)
- 
-        img = img.astype(np.float32) / 255.0
-        img_t = torch.from_numpy(img).unsqueeze(0)      # (1,H,W)
-        mask_t = torch.from_numpy(mask).unsqueeze(0)     # (1,H,W)
+        img = load_gray(img_path, self.size)
+        mask = load_mask(mask_path, self.size)
+        if self.train:
+            img, mask = augment_pair(img, mask, self.rng)
+        img_t = torch.from_numpy(img.copy()).unsqueeze(0).float()
+        mask_t = torch.from_numpy(mask.copy()).unsqueeze(0).float()
         return img_t, mask_t
- 
- 
-# --------------------------------------------------------------------------- #
-# Model: U-Net
-# --------------------------------------------------------------------------- #
+
+def worker_init_fn(worker_id):
+    info = torch.utils.data.get_worker_info()
+    info.dataset.rng = np.random.default_rng(info.seed % (2 ** 32))
+# Attention U-Net Architecture
 class ConvBlock(nn.Module):
-    def __init__(self, cin, cout):
+    def __init__(self, in_ch, out_ch, p_drop=0.0):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(cin, cout, 3, padding=1), nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
-            nn.Conv2d(cout, cout, 3, padding=1), nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+            nn.Dropout2d(p_drop) if p_drop > 0 else nn.Identity(),
         )
- 
     def forward(self, x):
         return self.block(x)
- 
- 
-class UNet(nn.Module):
-    def __init__(self, in_ch=1, out_ch=1, base=32):
+
+class AttentionGate(nn.Module):
+    def __init__(self, gate_ch, skip_ch, inter_ch):
         super().__init__()
-        self.enc1 = ConvBlock(in_ch, base)
-        self.enc2 = ConvBlock(base, base * 2)
-        self.enc3 = ConvBlock(base * 2, base * 4)
-        self.enc4 = ConvBlock(base * 4, base * 8)
-        self.pool = nn.MaxPool2d(2)
- 
-        self.bottleneck = ConvBlock(base * 8, base * 16)
- 
-        self.up4 = nn.ConvTranspose2d(base * 16, base * 8, 2, stride=2)
-        self.dec4 = ConvBlock(base * 16, base * 8)
-        self.up3 = nn.ConvTranspose2d(base * 8, base * 4, 2, stride=2)
-        self.dec3 = ConvBlock(base * 8, base * 4)
-        self.up2 = nn.ConvTranspose2d(base * 4, base * 2, 2, stride=2)
-        self.dec2 = ConvBlock(base * 4, base * 2)
-        self.up1 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)
-        self.dec1 = ConvBlock(base * 2, base)
- 
-        self.out_conv = nn.Conv2d(base, out_ch, 1)
- 
+        self.w_g = nn.Sequential(nn.Conv2d(gate_ch, inter_ch, 1), nn.BatchNorm2d(inter_ch))
+        self.w_x = nn.Sequential(nn.Conv2d(skip_ch, inter_ch, 1), nn.BatchNorm2d(inter_ch))
+        self.psi = nn.Sequential(nn.Conv2d(inter_ch, 1, 1), nn.BatchNorm2d(1), nn.Sigmoid())
+        self.relu = nn.ReLU(inplace=True)
+    def forward(self, g, x):
+        psi = self.psi(self.relu(self.w_g(g) + self.w_x(x)))
+        return x * psi
+
+class AttentionUNet(nn.Module):
+    def __init__(self, in_channels=1, out_channels=1, base_filters=32):
+        super().__init__()
+        f = base_filters
+        self.enc1, self.enc2 = ConvBlock(in_channels, f), ConvBlock(f, f * 2)
+        self.enc3, self.enc4 = ConvBlock(f * 2, f * 4), ConvBlock(f * 4, f * 8)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.bottleneck = ConvBlock(f * 8, f * 16, p_drop=0.3)
+
+        self.up4, self.att4 = nn.ConvTranspose2d(f * 16, f * 8, 2, stride=2), AttentionGate(f * 8, f * 8, f * 4)
+        self.dec4 = ConvBlock(f * 16, f * 8)
+        self.up3, self.att3 = nn.ConvTranspose2d(f * 8, f * 4, 2, stride=2), AttentionGate(f * 4, f * 4, f * 2)
+        self.dec3 = ConvBlock(f * 8, f * 4)
+        self.up2, self.att2 = nn.ConvTranspose2d(f * 4, f * 2, 2, stride=2), AttentionGate(f * 2, f * 2, f)
+        self.dec2 = ConvBlock(f * 4, f * 2)
+        self.up1, self.att1 = nn.ConvTranspose2d(f * 2, f, 2, stride=2), AttentionGate(f, f, max(1, f // 2))
+        self.dec1 = ConvBlock(f * 2, f)
+        self.head = nn.Conv2d(f, out_channels, 1)
+
     def forward(self, x):
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))
         e4 = self.enc4(self.pool(e3))
-        b = self.bottleneck(self.pool(e4))
- 
-        d4 = self.dec4(torch.cat([self.up4(b), e4], dim=1))
-        d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
-        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
-        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
-        return self.out_conv(d1)
- 
- 
-def dice_loss(pred_logits, target, eps=1e-6):
-    pred = torch.sigmoid(pred_logits)
-    pred = pred.view(pred.size(0), -1)
-    target = target.view(target.size(0), -1)
-    inter = (pred * target).sum(dim=1)
-    union = pred.sum(dim=1) + target.sum(dim=1)
-    dice = (2 * inter + eps) / (union + eps)
-    return 1 - dice.mean()
- 
- 
-def combo_loss(pred_logits, target):
-    bce = F.binary_cross_entropy_with_logits(pred_logits, target)
-    return bce + dice_loss(pred_logits, target)
- 
- 
-# --------------------------------------------------------------------------- #
-# Training
-# --------------------------------------------------------------------------- #
-def train_one_model(pairs, name, epochs=CFG.EPOCHS):
-    if len(pairs) < 2:
-        raise RuntimeError(
-            f"[{name}] Only {len(pairs)} image/mask pair(s) found — need at "
-            f"least 2 to form a train/val split. Check list_pairs() matching."
-        )
- 
-    pairs = list(pairs)
-    random.shuffle(pairs)
-    n_val = max(1, int(len(pairs) * CFG.VAL_FRAC))
-    n_val = min(n_val, len(pairs) - 1)  # always leave at least 1 for training
-    val_pairs, train_pairs = pairs[:n_val], pairs[n_val:]
- 
-    train_ds = SegDataset(train_pairs, CFG.IMG_SIZE, augment=True)
-    val_ds = SegDataset(val_pairs, CFG.IMG_SIZE, augment=False)
-    train_dl = DataLoader(train_ds, batch_size=CFG.BATCH_SIZE, shuffle=True,
-                           num_workers=CFG.NUM_WORKERS, pin_memory=True)
-    val_dl = DataLoader(val_ds, batch_size=CFG.BATCH_SIZE, shuffle=False,
-                         num_workers=CFG.NUM_WORKERS, pin_memory=True)
- 
-    model = UNet(in_ch=1, out_ch=1, base=32).to(CFG.DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=CFG.LR, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
- 
-    best_val = float("inf")
-    best_path = f"{name}_best.pt"
- 
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0.0
-        for imgs, masks in train_dl:
-            imgs, masks = imgs.to(CFG.DEVICE), masks.to(CFG.DEVICE)
-            optimizer.zero_grad()
-            logits = model(imgs)
-            loss = combo_loss(logits, masks)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item() * imgs.size(0)
-        train_loss /= len(train_ds)
- 
+        b  = self.bottleneck(self.pool(e4))
+
+        d4 = self.up4(b);  d4 = self.dec4(torch.cat([d4, self.att4(d4, e4)], dim=1))
+        d3 = self.up3(d4); d3 = self.dec3(torch.cat([d3, self.att3(d3, e3)], dim=1))
+        d2 = self.up2(d3); d2 = self.dec2(torch.cat([d2, self.att2(d2, e2)], dim=1))
+        d1 = self.up1(d2); d1 = self.dec1(torch.cat([d1, self.att1(d1, e1)], dim=1))
+        return self.head(d1)
+# Hybrid Loss, Metrics & Reusable K-Fold Trainer
+def dice_coeff(logits, targets, eps=1e-6):
+    probs = torch.sigmoid(logits).reshape(logits.size(0), -1)
+    targets = targets.reshape(targets.size(0), -1)
+    inter = (probs * targets).sum(1)
+    union = probs.sum(1) + targets.sum(1)
+    return ((2 * inter + eps) / (union + eps)).mean()
+
+class HybridLoss(nn.Module):
+    def __init__(self, pos_weight=4.0):
+        super().__init__()
+        self.pos_weight = pos_weight
+    def forward(self, logits, targets):
+        pw = torch.tensor(self.pos_weight, device=logits.device)
+        bce = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pw)
+        return bce + (1 - dice_coeff(logits, targets))
+
+def train_kfold(pairs, task_name, n_folds=N_FOLDS, epochs=EPOCHS, base_filters=32, patience=8):
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=SEED)
+    indices = np.arange(len(pairs))
+    fold_models, fold_histories = [], []
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(indices)):
+        print(f"\n=== {task_name} | Fold {fold + 1}/{n_folds} "
+              f"(train={len(train_idx)}, val={len(val_idx)}) ===")
+        train_pairs = [pairs[i] for i in train_idx]
+        val_pairs   = [pairs[i] for i in val_idx]
+
+        train_dl = DataLoader(SegDataset(train_pairs, train=True, seed=SEED + fold),
+                               batch_size=BATCH_SIZE, shuffle=True, num_workers=2,
+                               worker_init_fn=worker_init_fn, drop_last=True)
+        val_dl   = DataLoader(SegDataset(val_pairs, train=False, seed=SEED + fold),
+                               batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+
+        model = AttentionUNet(base_filters=base_filters).to(DEVICE)
+        opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+        criterion = HybridLoss(pos_weight=4.0)
+        scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
+
+        history = defaultdict(list)
+        best_dice, best_state, bad_epochs = -1.0, None, 0
+
+        for epoch in range(1, epochs + 1):
+            model.train()
+            tr_loss = tr_dice = 0.0
+            n_batches = 0
+            for imgs, masks in train_dl:
+                imgs, masks = imgs.to(DEVICE), masks.to(DEVICE)
+                opt.zero_grad()
+                with autocast(enabled=(DEVICE.type == "cuda")):
+                    logits = model(imgs)
+                    loss = criterion(logits, masks)
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+                tr_loss += loss.item()
+                tr_dice += dice_coeff(logits, masks).item()
+                n_batches += 1
+            sched.step()
+            tr_loss /= max(1, n_batches)
+            tr_dice /= max(1, n_batches)
+
+            model.eval()
+            va_loss = va_dice = 0.0
+            n_val = 0
+            with torch.no_grad():
+                for imgs, masks in val_dl:
+                    imgs, masks = imgs.to(DEVICE), masks.to(DEVICE)
+                    with autocast(enabled=(DEVICE.type == "cuda")):
+                        logits = model(imgs)
+                        loss = criterion(logits, masks)
+                    va_loss += loss.item()
+                    va_dice += dice_coeff(logits, masks).item()
+                    n_val += 1
+            va_loss /= max(1, n_val)
+            va_dice /= max(1, n_val)
+
+            history["train_loss"].append(tr_loss); history["val_loss"].append(va_loss)
+            history["train_dice"].append(tr_dice); history["val_dice"].append(va_dice)
+
+            if va_dice > best_dice:
+                best_dice = va_dice
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+
+            if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
+                print(f"  epoch {epoch:3d}/{epochs} | train_loss={tr_loss:.4f} dice={tr_dice:.4f} "
+                      f"| val_loss={va_loss:.4f} dice={va_dice:.4f}")
+            if bad_epochs >= patience:
+                print(f"  early stopping at epoch {epoch} (best val dice={best_dice:.4f})")
+                break
+
+        model.load_state_dict(best_state)
         model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for imgs, masks in val_dl:
-                imgs, masks = imgs.to(CFG.DEVICE), masks.to(CFG.DEVICE)
-                logits = model(imgs)
-                loss = combo_loss(logits, masks)
-                val_loss += loss.item() * imgs.size(0)
-        val_loss /= max(1, len(val_ds))
-        scheduler.step()
- 
-        print(f"[{name}] epoch {epoch+1}/{epochs}  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
- 
-        if val_loss < best_val:
-            best_val = val_loss
-            torch.save(model.state_dict(), best_path)
- 
-    model.load_state_dict(torch.load(best_path, map_location=CFG.DEVICE))
-    return model
- 
- 
-# --------------------------------------------------------------------------- #
-# Inference
-# --------------------------------------------------------------------------- #
-@torch.no_grad()
-def predict_mask(model, img_path, img_size=CFG.IMG_SIZE, thresh=0.5):
-    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    orig_h, orig_w = img.shape[:2]
-    img_r = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
-    img_t = torch.from_numpy(img_r.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(CFG.DEVICE)
-    logits = model(img_t)
-    prob = torch.sigmoid(logits)[0, 0].cpu().numpy()
-    mask = (prob > thresh).astype(np.uint8)
-    mask = cv2.resize(mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-    return mask, (orig_h, orig_w)
- 
- 
-def fit_line_to_component(component_mask):
-    """Fit a line (vx, vy, x0, y0) to a binary component using cv2.fitLine."""
-    ys, xs = np.nonzero(component_mask)
-    if len(xs) < 2:
+        fold_models.append(model)
+        fold_histories.append(history)
+        print(f"  -> {task_name} fold {fold + 1} best val dice: {best_dice:.4f}")
+
+    return fold_models, fold_histories
+# Train both branches (5-fold each)
+print("Training aponeurosis boundary segmentation ensemble...")
+apo_models, apo_histories = train_kfold(apo_pairs, "Aponeurosis", n_folds=N_FOLDS, epochs=EPOCHS,
+                                         base_filters=32, patience=PATIENCE)
+
+print("\nTraining fascicle segmentation ensemble (larger epoch budget - slower to converge)...")
+fasc_models, fasc_histories = train_kfold(fasc_pairs, "Fascicle", n_folds=N_FOLDS, epochs=FASC_EPOCHS,
+                                          base_filters=24, patience=FASC_PATIENCE)
+# Figure 1: Empirical Convergence Diagnostics
+fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+for row, (name, histories) in enumerate([("Aponeurosis", apo_histories), ("Fascicle", fasc_histories)]):
+    max_len = max(len(h["train_loss"]) for h in histories)
+    def pad_mean(key):
+        arrs = [np.array(h[key] + [h[key][-1]] * (max_len - len(h[key]))) for h in histories]
+        return np.mean(arrs, axis=0)
+    epochs_arr = np.arange(1, max_len + 1)
+
+    axes[row, 0].plot(epochs_arr, pad_mean("train_loss"), "o-", ms=3, label="Train Loss")
+    axes[row, 0].plot(epochs_arr, pad_mean("val_loss"), "s--", ms=3, label="Val Loss")
+    axes[row, 0].set_title(f"{name}: Hybrid Loss (mean over {len(histories)} folds)", fontweight="bold")
+    axes[row, 0].set_xlabel("Epoch"); axes[row, 0].grid(alpha=0.4, linestyle=":"); axes[row, 0].legend()
+
+    axes[row, 1].plot(epochs_arr, pad_mean("train_dice"), "o-", ms=3, label="Train Dice")
+    axes[row, 1].plot(epochs_arr, pad_mean("val_dice"), "s--", ms=3, label="Val Dice")
+    axes[row, 1].set_title(f"{name}: Dice Score (mean over {len(histories)} folds)", fontweight="bold")
+    axes[row, 1].set_xlabel("Epoch"); axes[row, 1].grid(alpha=0.4, linestyle=":"); axes[row, 1].legend()
+
+plt.tight_layout()
+plt.savefig("training_convergence_diagnostics.png", dpi=150)
+plt.close()
+print("Figure 1 generated: training_convergence_diagnostics.png")
+# Figure 1: Empirical Convergence Diagnostics
+fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+for row, (name, histories) in enumerate([("Aponeurosis", apo_histories), ("Fascicle", fasc_histories)]):
+    max_len = max(len(h["train_loss"]) for h in histories)
+    def pad_mean(key):
+        arrs = [np.array(h[key] + [h[key][-1]] * (max_len - len(h[key]))) for h in histories]
+        return np.mean(arrs, axis=0)
+    epochs_arr = np.arange(1, max_len + 1)
+
+    axes[row, 0].plot(epochs_arr, pad_mean("train_loss"), "o-", ms=3, label="Train Loss")
+    axes[row, 0].plot(epochs_arr, pad_mean("val_loss"), "s--", ms=3, label="Val Loss")
+    axes[row, 0].set_title(f"{name}: Hybrid Loss (mean over {len(histories)} folds)", fontweight="bold")
+    axes[row, 0].set_xlabel("Epoch"); axes[row, 0].grid(alpha=0.4, linestyle=":"); axes[row, 0].legend()
+
+    axes[row, 1].plot(epochs_arr, pad_mean("train_dice"), "o-", ms=3, label="Train Dice")
+    axes[row, 1].plot(epochs_arr, pad_mean("val_dice"), "s--", ms=3, label="Val Dice")
+    axes[row, 1].set_title(f"{name}: Dice Score (mean over {len(histories)} folds)", fontweight="bold")
+    axes[row, 1].set_xlabel("Epoch"); axes[row, 1].grid(alpha=0.4, linestyle=":"); axes[row, 1].legend()
+
+plt.tight_layout()
+plt.savefig("training_convergence_diagnostics.png", dpi=150)
+plt.close()
+print("Figure 1 generated: training_convergence_diagnostics.png")
+# Ensemble + TTA inference helper (shared by both branches)
+def predict_ensemble(models, img_crop_gray, size=IMG_SIZE):
+    h, w = img_crop_gray.shape[:2]
+    inp = cv2.resize(img_crop_gray, (size, size), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    inp_flip = inp[:, ::-1].copy()
+    batch = torch.from_numpy(np.stack([inp, inp_flip])).unsqueeze(1).float().to(DEVICE)
+
+    probs_accum = np.zeros((size, size), dtype=np.float32)
+    with torch.no_grad():
+        for model in models:
+            with autocast(enabled=(DEVICE.type == "cuda")):
+                logits = model(batch)
+            probs = torch.sigmoid(logits).float().cpu().numpy()
+            probs_accum += probs[0, 0]
+            probs_accum += probs[1, 0][:, ::-1]
+    probs_accum /= (2 * len(models))
+    return cv2.resize(probs_accum, (w, h), interpolation=cv2.INTER_LINEAR)
+# Figure 2: Qualitative Segmentation Reconstruction
+sample_indices = sorted(set([0, min(6, len(test_files) - 1), min(len(test_files) // 2, len(test_files) - 1)]))
+fig, axes = plt.subplots(len(sample_indices), 3, figsize=(16, 3.6 * len(sample_indices)))
+if len(sample_indices) == 1:
+    axes = axes.reshape(1, -1)
+
+for row, si in enumerate(sample_indices):
+    sample_path = test_files[si]
+    with Image.open(sample_path) as im:
+        raw_sample = np.asarray(im.convert("L"), dtype=np.float32)
+
+    apo_p = predict_ensemble(apo_models, raw_sample.astype(np.uint8))
+    fasc_p = predict_ensemble(fasc_models, raw_sample.astype(np.uint8))
+
+    axes[row, 0].imshow(raw_sample, cmap="gray"); axes[row, 0].set_title(sample_path.name, fontsize=10, fontweight="bold"); axes[row, 0].axis("off")
+    axes[row, 1].imshow(raw_sample, cmap="gray"); axes[row, 1].imshow(apo_p > 0.5, cmap="autumn", alpha=0.5)
+    axes[row, 1].set_title("Predicted Aponeurosis", fontsize=10, fontweight="bold"); axes[row, 1].axis("off")
+    axes[row, 2].imshow(raw_sample, cmap="gray"); axes[row, 2].imshow(fasc_p > 0.5, cmap="cool", alpha=0.5)
+    axes[row, 2].set_title("Predicted Fascicle", fontsize=10, fontweight="bold"); axes[row, 2].axis("off")
+
+plt.tight_layout()
+plt.savefig("segmentation_reconstruction_sample.png", dpi=150)
+plt.close()
+print("Figure 2 generated: segmentation_reconstruction_sample.png")
+# Geometric Measurement Extraction
+def extract_mt_px(apo_prob, thresh=0.5, min_valid_cols=10):
+    h, w = apo_prob.shape
+    binm = (apo_prob > thresh).astype(np.uint8)
+    sup_ys, deep_ys = np.full(w, np.nan), np.full(w, np.nan)
+    for x in range(w):
+        col = np.where(binm[:, x] > 0)[0]
+        if len(col) == 0:
+            continue
+        splits = np.where(np.diff(col) > 1)[0]
+        runs = np.split(col, splits + 1)
+        if len(runs) >= 2:
+            sup_ys[x] = runs[0].mean()
+            deep_ys[x] = runs[-1].mean()
+    valid = ~np.isnan(sup_ys) & ~np.isnan(deep_ys)
+    if valid.sum() < min_valid_cols:
+        return None
+    thickness_px = float(np.nanmedian(deep_ys[valid] - sup_ys[valid]))
+    return thickness_px, sup_ys, deep_ys, valid
+
+def estimate_deep_line_angle(deep_ys, valid):
+    xs = np.where(valid)[0].astype(np.float32)
+    ys = deep_ys[valid].astype(np.float32)
+    if len(xs) < 5:
+        return 0.0
+    slope = np.polyfit(xs, ys, 1)[0]
+    return float(np.degrees(np.arctan(slope)))
+
+def extract_pa_fl_px(fasc_prob, deep_angle_deg=0.0, thresh=0.5, min_pixels=15):
+    ys, xs = np.where(fasc_prob > thresh)
+    if len(xs) < min_pixels:
         return None
     pts = np.column_stack([xs, ys]).astype(np.float32)
     vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
-    return vx, vy, x0, y0
- 
- 
-def line_angle_deg(vx, vy):
-    """Angle of a direction vector relative to horizontal, in degrees [0,180)."""
-    angle = math.degrees(math.atan2(vy, vx))
-    return angle % 180
- 
- 
-def perpendicular_distance_between_lines(line1, line2, img_shape):
+    fasc_angle = abs(np.degrees(np.arctan2(vy, vx)))
+    if fasc_angle > 90:
+        fasc_angle = 180 - fasc_angle
+    pa_deg = float(np.clip(abs(fasc_angle - abs(deep_angle_deg)), 1.0, 45.0))
+    proj = (xs - x0) * vx + (ys - y0) * vy
+    length_px = float(proj.max() - proj.min())
+    return pa_deg, length_px
 
-    h, w = img_shape
-    xc = w / 2.0
- 
-    def y_at_x(line, x):
-        vx, vy, x0, y0 = line
-        if abs(vx) < 1e-6:
-            return y0
-        t = (x - x0) / vx
-        return y0 + t * vy
- 
-    y1 = y_at_x(line1, xc)
-    y2 = y_at_x(line2, xc)
-    raw_gap = abs(y2 - y1)
- 
-    # average angle of the two aponeurosis lines relative to horizontal
-    a1 = math.atan2(line1[1], line1[0])
-    a2 = math.atan2(line2[1], line2[0])
-    avg_angle = (a1 + a2) / 2.0
-    perpendicular_gap = raw_gap * math.cos(avg_angle)
-    return abs(perpendicular_gap)
- 
- 
-def measure_from_masks(apo_mask, fasc_mask):
+records, fallback_log = [], []
+
+for fpath in tqdm(test_files, desc="Ensemble inference + measurement", ncols=100):
+    fname = fpath.name
+    with Image.open(fpath) as im:
+        img_np = np.asarray(im)
+
+    px_per_cm, l, t, r, b = decode_hardware_scale(img_np, fname)
+    mm_per_px = 10.0 / px_per_cm
+    h_orig, w_orig = img_np.shape[:2]
+    l, t, r, b = max(0, l), max(0, t), min(w_orig, r), min(h_orig, b)
+    if r <= l + 40 or b <= t + 40:
+        l, t, r, b = 0, 0, w_orig, h_orig
+    crop = img_np[t:b, l:r]
+    if crop.ndim == 3:
+        crop_gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.shape[2] == 3 else crop[:, :, 0]
+    else:
+        crop_gray = crop
+
+    apo_prob = predict_ensemble(apo_models, crop_gray)
+    fasc_prob = predict_ensemble(fasc_models, crop_gray)
+
+    mt_res = extract_mt_px(apo_prob)
+    if mt_res is None:
+        prof = crop_gray.mean(axis=1).astype(np.float32)
+        win = min(31, len(prof) - 1)
+        win -= (win % 2 == 0)
+        prof_s = savgol_filter(prof, max(win, 5), 2) if win >= 5 else prof
+        sup_y = int(np.argmax(prof_s[:max(1, int(0.4 * len(prof_s)))]))
+        deep_y = int(sup_y + 2.0 * px_per_cm)
+        thickness_px = float(max(1.0, deep_y - sup_y))
+        deep_angle = 0.0
+        fallback_log.append((fname, "apo_fallback"))
+    else:
+        thickness_px, sup_ys, deep_ys, valid = mt_res
+        deep_angle = estimate_deep_line_angle(deep_ys, valid)
+
+    pa_fl_res = extract_pa_fl_px(fasc_prob, deep_angle_deg=deep_angle)
+    if pa_fl_res is None:
+        pa_deg = 17.0
+        length_px = thickness_px / max(0.05, math.sin(math.radians(pa_deg)))
+        fallback_log.append((fname, "fasc_fallback"))
+    else:
+        pa_deg, length_px = pa_fl_res
+
+    mt_mm = thickness_px * mm_per_px
+    fl_mm = length_px * mm_per_px
+
+    # Physiological consistency clamp, applied per-scan using only that scan's own MT & PA.
+    sin_pa = max(0.05, math.sin(math.radians(pa_deg)))
+    implied_fl = mt_mm / sin_pa
+    ratio = fl_mm / implied_fl if implied_fl > 0 else 1.0
+    ratio_clipped = float(np.clip(ratio, 0.90, 1.22))
+    fl_mm = implied_fl * ratio_clipped
+
+    records.append({
+        "image_id": fname,
+        "pa_deg": round(float(np.clip(pa_deg, 5.0, 45.0)), 4),
+        "fl_mm": round(float(np.clip(fl_mm, 30.0, 200.0)), 4),
+        "mt_mm": round(float(np.clip(mt_mm, 10.0, 50.0)), 4),
+    })
+
+df_opt = pd.DataFrame(records)
+print(f"Measurements extracted for {len(df_opt)} scans "
+      f"({len(fallback_log)} used a heuristic fallback due to inconclusive segmentation).")
+# Spatio-Temporal Cine-Loop Smoothing
+df_opt = df_opt.sort_values("image_id").reset_index(drop=True)
+SMOOTH_WINDOW = 5
+for col in ["pa_deg", "fl_mm", "mt_mm"]:
+    rolled = df_opt[col].rolling(window=SMOOTH_WINDOW, center=True, min_periods=1).median()
+    df_opt[col] = (0.7 * df_opt[col] + 0.3 * rolled).round(4)
+
+print("+----------------------------------------------------------------+")
+print(f"| Cine-Loop Temporal Smoothing Applied  : {SMOOTH_WINDOW}-frame rolling median   |")
+print(f"| Physiological Ratio Bound Enforced    : FL/(MT/sin(PA)) in [0.90, 1.22]  |")
+print("+----------------------------------------------------------------+")
+# Figure 3: Parametric Biomechanical Architecture Distributions
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+cols = [
+    ("pa_deg", "Pennation Angle (PA)", "Degrees (deg)", "#1f77b4"),
+    ("fl_mm",  "Fascicle Length (FL)",  "Millimetres (mm)", "#2ca02c"),
+    ("mt_mm",  "Muscle Thickness (MT)", "Millimetres (mm)", "#d62728"),
+]
+for ax, (col, title, unit, color) in zip(axes, cols):
+    data = df_opt[col]
+    ax.hist(data, bins=25, color=color, alpha=0.65, edgecolor="black", density=True, label="Empirical Density")
+    ax.axvline(data.mean(), color="black", lw=2, linestyle="--", label=f"Cohort Mean: {data.mean():.2f}")
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_xlabel(unit, fontsize=10); ax.set_ylabel("Probability Density", fontsize=10)
+    ax.grid(True, linestyle=":", alpha=0.5); ax.legend(fontsize=8, frameon=True)
+
+plt.tight_layout()
+plt.savefig("biomechanical_parameter_distributions.png", dpi=150)
+plt.close()
+print("Figure 3 generated: biomechanical_parameter_distributions.png")
+# Export Official Submission
+if SAMPLE_SUB.exists():
+    sample_df, sub_sep = read_csv_smart(SAMPLE_SUB)
+    sub_cols = list(sample_df.columns)
+    print(f"Read sample_submission.csv with delimiter {repr(sub_sep)} -> columns: {sub_cols}")
+
    
-    h, w = apo_mask.shape
- 
-    # --- Split aponeurosis mask into its connected components, keep 2 largest ---
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(apo_mask, connectivity=8)
-    comp_sizes = [(i, stats[i, cv2.CC_STAT_AREA]) for i in range(1, num_labels)]
-    comp_sizes.sort(key=lambda x: -x[1])
- 
-    if len(comp_sizes) < 2:
-        return None  # can't find both aponeuroses
- 
-    top_two = comp_sizes[:2]
-    comps = []
-    for idx, _ in top_two:
-        comp_mask = (labels == idx).astype(np.uint8)
-        line = fit_line_to_component(comp_mask)
-        if line is None:
-            return None
-        # mean y position, to distinguish superficial (upper) vs deep (lower)
-        ys, _ = np.nonzero(comp_mask)
-        comps.append((line, ys.mean()))
- 
-    comps.sort(key=lambda c: c[1])  # sort by mean y: index0 = superficial, index1 = deep
-    superficial_line, _ = comps[0]
-    deep_line, _ = comps[1]
- 
-    mt_px = perpendicular_distance_between_lines(superficial_line, deep_line, (h, w))
- 
-    # --- Fascicle line ---
-    fasc_line = fit_line_to_component(fasc_mask)
-    if fasc_line is None:
-        return None
- 
-    vx_f, vy_f, x0_f, y0_f = fasc_line
-    vx_d, vy_d, _, _ = deep_line
- 
-    # Pennation angle: angle between fascicle direction and deep aponeurosis direction
-    dot = vx_f * vx_d + vy_f * vy_d
-    dot = np.clip(dot, -1.0, 1.0)
-    pa_deg = math.degrees(math.acos(abs(dot)))  # acute angle between the two lines
- 
-    # --- Fascicle length: length of fascicle segment clipped between the two aponeurosis lines ---
-    ys_f, xs_f = np.nonzero(fasc_mask)
-    if len(xs_f) == 0:
-        return None
-    y_min, y_max = ys_f.min(), ys_f.max()
- 
-    def x_at_y(line, y):
-        vx, vy, x0, y0 = line
-        if abs(vy) < 1e-6:
-            return x0
-        t = (y - y0) / vy
-        return x0 + t * vx
- 
-    # project fascicle segment endpoints onto the fascicle's own line at the
-    # y-range spanned by the two aponeuroses (approx superficial->deep)
-    y_top = min(y_min, y_max)
-    y_bot = max(y_min, y_max)
-    x_top = x_at_y(fasc_line, y_top)
-    x_bot = x_at_y(fasc_line, y_bot)
-    fl_px = math.hypot(x_bot - x_top, y_bot - y_top)
- 
-    return pa_deg, fl_px, mt_px
- 
- 
-# --------------------------------------------------------------------------- #
-# Main pipeline
-# --------------------------------------------------------------------------- #
-def main():
-    print("Device:", CFG.DEVICE)
- 
-    # 1) Build train pairs and train the two segmentation models
-    apo_pairs = list_pairs(CFG.APO_IMG_DIR, CFG.APO_MASK_DIR)
-    fasc_pairs = list_pairs(CFG.FASC_IMG_DIR, CFG.FASC_MASK_DIR)
-    print(f"Found {len(apo_pairs)} aponeurosis pairs, {len(fasc_pairs)} fascicle pairs")
- 
-    if len(apo_pairs) == 0:
-        raise RuntimeError(
-            f"No image/mask pairs found for aponeurosis data.\n"
-            f"  Checked images in: {CFG.APO_IMG_DIR}\n"
-            f"  Checked masks in:  {CFG.APO_MASK_DIR}\n"
-            f"Run this to inspect actual filenames and fix the matching logic "
-            f"in list_pairs() if needed:\n"
-            f"  print(os.listdir('{CFG.APO_IMG_DIR}')[:5])\n"
-            f"  print(os.listdir('{CFG.APO_MASK_DIR}')[:5])"
-        )
-    if len(fasc_pairs) == 0:
-        raise RuntimeError(
-            f"No image/mask pairs found for fascicle data.\n"
-            f"  Checked images in: {CFG.FASC_IMG_DIR}\n"
-            f"  Checked masks in:  {CFG.FASC_MASK_DIR}\n"
-            f"Run this to inspect actual filenames and fix the matching logic "
-            f"in list_pairs() if needed:\n"
-            f"  print(os.listdir('{CFG.FASC_IMG_DIR}')[:5])\n"
-            f"  print(os.listdir('{CFG.FASC_MASK_DIR}')[:5])"
-        )
- 
-    apo_model = train_one_model(apo_pairs, name="apo_unet")
-    fasc_model = train_one_model(fasc_pairs, name="fasc_unet")
- 
-    apo_model.eval()
-    fasc_model.eval()
- 
-    # 2) inference on all test images and compute geometry-based measurements
-    test_paths = sorted(glob.glob(os.path.join(CFG.TEST_IMG_DIR, "*")))
-    print(f"Found {len(test_paths)} test images")
- 
+    id_col = None
+    for cand in ["image_id", "id", "ID", "Id", "filename", "Filename", "image", "Image"]:
+        if cand in sub_cols:
+            id_col = cand
+            break
+    if id_col is None:
+        id_col = sub_cols[0]  # fall back to whatever the first column is
+    print(f"Detected sample_submission.csv identifier column: '{id_col}'")
 
-    fallback_pa, fallback_fl, fallback_mt = 15.0, 25.0, 15.0
- 
-    rows = []
-    for path in tqdm(test_paths, desc="Inference"):
-        image_id = os.path.splitext(os.path.basename(path))[0]
-        spacing = get_pixel_spacing(image_id)
- 
-        apo_mask, shape = predict_mask(apo_model, path)
-        fasc_mask, _ = predict_mask(fasc_model, path)
- 
-        result = measure_from_masks(apo_mask, fasc_mask)
-        if result is None:
-            pa_deg, fl_mm, mt_mm = fallback_pa, fallback_fl, fallback_mt
-        else:
-            pa_deg, fl_px, mt_px = result
-            fl_mm = fl_px * spacing
-            mt_mm = mt_px * spacing
- 
-        rows.append({
-            "image_id": image_id,
-            "pa_deg": round(float(pa_deg), 2),
-            "fl_mm": round(float(fl_mm), 2),
-            "mt_mm": round(float(mt_mm), 2),
-        })
- 
-    sub_df = pd.DataFrame(rows)
- 
-  
-    if os.path.exists(CFG.SAMPLE_SUB):
-        sample = pd.read_csv(CFG.SAMPLE_SUB)
-        sub_df = sample[["image_id"]].merge(sub_df, on="image_id", how="left")
-        sub_df[["pa_deg", "fl_mm", "mt_mm"]] = sub_df[["pa_deg", "fl_mm", "mt_mm"]].fillna(
-            {"pa_deg": fallback_pa, "fl_mm": fallback_fl, "mt_mm": fallback_mt}
+    value_cols = [c for c in ["pa_deg", "fl_mm", "mt_mm"] if c in sub_cols]
+    if not value_cols:
+        raise KeyError(
+            f"None of the expected value columns (pa_deg, fl_mm, mt_mm) were found in "
+            f"sample_submission.csv columns {sub_cols}. This usually means the delimiter "
+            f"sniffing above picked the wrong separator - inspect the raw file's header "
+            f"line and adjust `detect_delimiter` if needed."
         )
- 
-    sub_df.to_csv(CFG.OUTPUT_SUB, index=False)
-    print(f"Saved submission to {CFG.OUTPUT_SUB}")
-    print(sub_df.head())
- 
- 
-if __name__ == "__main__":
-    main()
- 
+
+    # sample_submission ids may be either the full filename ("IMG_00001.tif") or the
+    # extension-less stem ("IMG_00001") - detect which one matches our predictions better.
+    df_opt_keyed = df_opt.copy()
+    df_opt_keyed["_stem"] = df_opt_keyed["image_id"].apply(lambda x: Path(x).stem)
+
+    sample_ids = sample_df[id_col].astype(str)
+    full_match_rate = sample_ids.isin(df_opt_keyed["image_id"]).mean()
+    stem_match_rate = sample_ids.isin(df_opt_keyed["_stem"]).mean()
+    key_col = "image_id" if full_match_rate >= stem_match_rate else "_stem"
+    print(f"Matching sample_submission '{id_col}' against prediction key '{key_col}' "
+          f"(match rate: {max(full_match_rate, stem_match_rate):.1%})")
+
+   
+    predicted_ids = pd.Index(df_opt_keyed[key_col].astype(str))
+    sample_id_index = pd.Index(sample_ids.astype(str).values)
+    all_ids = predicted_ids.union(sample_id_index, sort=False)
+    all_ids = pd.Index(sorted(all_ids))  # deterministic, natural-sort-ish order
+
+    n_template_only = len(sample_id_index.difference(predicted_ids))
+    n_extra_predicted = len(predicted_ids.difference(sample_id_index))
+    print(f"sample_submission.csv had {len(sample_id_index)} template row(s); "
+          f"{len(predicted_ids)} test image(s) were actually predicted "
+          f"({n_extra_predicted} beyond the template, {n_template_only} template id(s) "
+          f"not among the predictions). Emitting {len(all_ids)} row(s) total.")
+
+    lookup = df_opt_keyed.set_index(key_col)[["pa_deg", "fl_mm", "mt_mm"]]
+    matched = lookup.reindex(all_ids)
+
+    df_final = matched.reset_index().rename(columns={key_col: id_col, "index": id_col})
+    df_final = df_final[[id_col] + value_cols]
+
+    n_missing = int(df_final[value_cols].isnull().any(axis=1).sum())
+    if n_missing > 0:
+        print(f"WARNING: {n_missing} row(s) had no matching prediction; "
+              f"filling with cohort medians as a last resort.")
+        for col in value_cols:
+            df_final[col] = df_final[col].fillna(df_opt[col].median())
+
+    # Preserve sample_submission's column set/order; any columns beyond id + value
+    # (unlikely for this competition) are carried over empty rather than dropped.
+    for extra_col in sub_cols:
+        if extra_col not in df_final.columns:
+            df_final[extra_col] = sample_df[extra_col].iloc[0] if len(sample_df) else ""
+    df_final = df_final[sub_cols]
+else:
+    sub_cols = ["image_id", "pa_deg", "fl_mm", "mt_mm"]
+    sub_sep = ","
+    df_final = df_opt[sub_cols]
+
+# --- FIX: always WRITE submission.csv as standard comma-separated -------------------
+# sample_submission.csv on this competition happens to ship semicolon-delimited, and the
+# sniffing above is correct/useful for READING it (so we pick up the right id column name
+# and column order). But the previous version also reused that same delimiter to WRITE
+# submission.csv. ----'s (and virtually every) submission grader parses uploaded CSVs
+# with a plain comma reader, so a semicolon-written file collapses into a single column
+# literally named "image_id;pa_deg;fl_mm;mt_mm" - there is no column called just
+# "image_id", which is exactly the "ID column image_id not found in submission" error.
+# The output delimiter must always be a comma regardless of what the template used.
+write_sep = ","
+if sub_sep != ",":
+    print(f"NOTE: sample_submission.csv used delimiter {repr(sub_sep)}, but submission.csv "
+          f"is always written as comma-separated ({repr(write_sep)}) since that's what the "
+          f"grader expects.")
+
+submission_path = "submission.csv"
+df_final.to_csv(submission_path, index=False, sep=write_sep)
+
+df_sub = pd.read_csv(submission_path, sep=write_sep)
+assert os.path.exists(submission_path), "Submission file was not written."
+assert list(df_sub.columns) == sub_cols, "Submission columns do not match sample_submission.csv."
+assert len(df_sub) >= len(test_files), (
+    f"Submission has {len(df_sub)} row(s) but {len(test_files)} test image(s) were found - "
+    f"the grader will reject a submission that doesn't cover every test image."
+)
+value_check_cols = [c for c in sub_cols if c in ("pa_deg", "fl_mm", "mt_mm")]
+assert not df_sub[value_check_cols].isnull().values.any(), "Submission contains null values."
+
+print("+----------------------------------------------------------------+")
+print("| MUSCLE ARCHITECTURE MORPHOMETRY SCORECARD                      |")
+print("+----------------------------------------------------------------+")
+print(f"| Total Test Scans Evaluated : {len(df_sub):<34} |")
+if "mt_mm" in df_sub.columns:
+    print(f"| Mean Muscle Thickness (MT) : {df_sub['mt_mm'].mean():.2f} +/- {df_sub['mt_mm'].std():.2f} mm{'':<18} |")
+if "pa_deg" in df_sub.columns:
+    print(f"| Mean Pennation Angle  (PA) : {df_sub['pa_deg'].mean():.2f} +/- {df_sub['pa_deg'].std():.2f} deg{'':<17} |")
+if "fl_mm" in df_sub.columns:
+    print(f"| Mean Fascicle Length  (FL) : {df_sub['fl_mm'].mean():.2f} +/- {df_sub['fl_mm'].std():.2f} mm{'':<18} |")
+print(f"| Submission delimiter used  : {repr(write_sep):<34} |")
+print(f"| Format Verification        : {len(df_sub)} rows, 0 nulls (Valid Format){'':<3} |")
+print("+----------------------------------------------------------------+")
+print()
+print("First 5 predicted volumes:")
+print(df_sub.head())
+
